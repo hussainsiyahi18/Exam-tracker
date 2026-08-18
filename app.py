@@ -1,19 +1,18 @@
-"""
-Exam Study & Goal Tracker
---------------------------
-A single-file Streamlit + SQLite application for tracking exam study goals,
-attaching resources (notes/PPTs/PYQs), running a topic-level Pomodoro focus
-timer, spaced-repetition revision scheduling, study analytics, and .ics
-calendar export.
+"""Exam Study & Goal Tracker
 
-Run with:
+Single-file Streamlit + SQLite application with:
+- Full goal CRUD, including editing and deletion
+- Markdown notes per goal
+- Spaced repetition (+1, +3, +7 days)
+- Topic-level focus timer and study logging
+- Study analytics, heatmap and streaks
+- .ics calendar export for exam/revision milestones
+
+Install:
     pip install streamlit pandas plotly icalendar
-    streamlit run app.py
 
-Additional dependencies introduced in this version (beyond the original
-streamlit + pandas):
-    plotly     -> interactive heatmap / pie / bar charts on the Analytics page
-    icalendar  -> generates the downloadable .ics calendar export
+Run:
+    streamlit run exam_tracker_updated.py
 """
 
 import os
@@ -23,7 +22,7 @@ import sys
 import time
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, date, time as dtime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 
 import pandas as pd
 import plotly.express as px
@@ -31,38 +30,34 @@ import plotly.graph_objects as go
 import streamlit as st
 from icalendar import Calendar, Event
 
-# --------------------------------------------------------------------------
-# Configuration & constants
-# --------------------------------------------------------------------------
+
+# =============================================================================
+# Configuration
+# =============================================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "study_tracker.db")
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 PRIORITIES = ["High", "Medium", "Low"]
 STATUSES = ["Pending", "Completed"]
 EXAM_TYPES = ["Mid-term", "End-term"]
 RESOURCE_TYPES = ["Notes", "PPT", "PYQ"]
-
-URGENT_WINDOW_HOURS = 48
-
-# Spaced-repetition schedule: review stage -> days after completion
 SRS_INTERVALS = {1: 1, 2: 3, 3: 7}
 SRS_STAGE_LABELS = {1: "+1 Day Review", 2: "+3 Day Review", 3: "+7 Day Review"}
+URGENT_WINDOW_HOURS = 48
 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-
-# --------------------------------------------------------------------------
-# Database helpers
-# --------------------------------------------------------------------------
+# =============================================================================
+# Database
+# =============================================================================
 
 @contextmanager
 def get_conn():
-    """Yield a SQLite connection with row access by column name."""
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA foreign_keys = ON")
     try:
         yield conn
         conn.commit()
@@ -70,15 +65,13 @@ def get_conn():
         conn.close()
 
 
-def _existing_columns(conn, table):
-    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+def existing_columns(conn, table):
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
 def init_db():
-    """Create tables if they don't exist yet (fresh installs get the full schema)."""
     with get_conn() as conn:
-        cur = conn.cursor()
-        cur.execute(
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS goals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,13 +81,14 @@ def init_db():
                 priority TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'Pending',
                 exam_type TEXT NOT NULL,
+                notes TEXT DEFAULT '',
                 completed_at TEXT,
                 next_review_date TEXT,
                 review_stage INTEGER NOT NULL DEFAULT 0
-            );
+            )
             """
         )
-        cur.execute(
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS resources (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,11 +96,11 @@ def init_db():
                 file_name TEXT NOT NULL,
                 file_path TEXT NOT NULL,
                 file_type TEXT NOT NULL,
-                FOREIGN KEY (goal_id) REFERENCES goals (id) ON DELETE CASCADE
-            );
+                FOREIGN KEY (goal_id) REFERENCES goals(id) ON DELETE CASCADE
+            )
             """
         )
-        cur.execute(
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS study_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,42 +109,47 @@ def init_db():
                 log_date TEXT NOT NULL,
                 topic TEXT,
                 goal_id INTEGER
-            );
+            )
             """
         )
 
 
 def run_migrations():
-    """Backward-compatible schema upgrade for databases created by earlier
-    versions of this app. Only ALTERs a column in if it's actually missing,
-    so this is safe to call on every startup."""
+    """Safely add columns introduced by newer versions."""
     with get_conn() as conn:
-        goal_cols = _existing_columns(conn, "goals")
-        if "completed_at" not in goal_cols:
-            conn.execute("ALTER TABLE goals ADD COLUMN completed_at TEXT")
-        if "next_review_date" not in goal_cols:
-            conn.execute("ALTER TABLE goals ADD COLUMN next_review_date TEXT")
-        if "review_stage" not in goal_cols:
-            conn.execute("ALTER TABLE goals ADD COLUMN review_stage INTEGER NOT NULL DEFAULT 0")
+        goal_cols = existing_columns(conn, "goals")
+        migrations = {
+            "notes": "ALTER TABLE goals ADD COLUMN notes TEXT DEFAULT ''",
+            "completed_at": "ALTER TABLE goals ADD COLUMN completed_at TEXT",
+            "next_review_date": "ALTER TABLE goals ADD COLUMN next_review_date TEXT",
+            "review_stage": "ALTER TABLE goals ADD COLUMN review_stage INTEGER NOT NULL DEFAULT 0",
+        }
+        for column, statement in migrations.items():
+            if column not in goal_cols:
+                conn.execute(statement)
 
-        log_cols = _existing_columns(conn, "study_logs")
+        log_cols = existing_columns(conn, "study_logs")
         if "topic" not in log_cols:
             conn.execute("ALTER TABLE study_logs ADD COLUMN topic TEXT")
         if "goal_id" not in log_cols:
             conn.execute("ALTER TABLE study_logs ADD COLUMN goal_id INTEGER")
 
 
-# ---- Goals ----------------------------------------------------------------
+# =============================================================================
+# Goal CRUD
+# =============================================================================
 
-def add_goal(subject, topic, deadline_dt, priority, exam_type):
+def add_goal(subject, topic, deadline_dt, priority, exam_type, notes=""):
     with get_conn() as conn:
-        conn.execute(
+        cur = conn.execute(
             """
-            INSERT INTO goals (subject, topic, deadline, priority, status, exam_type)
-            VALUES (?, ?, ?, ?, 'Pending', ?)
+            INSERT INTO goals
+                (subject, topic, deadline, priority, status, exam_type, notes)
+            VALUES (?, ?, ?, ?, 'Pending', ?, ?)
             """,
-            (subject.strip(), topic.strip(), deadline_dt.isoformat(sep=" "), priority, exam_type),
+            (subject.strip(), topic.strip(), deadline_dt.isoformat(sep=" "), priority, exam_type, notes),
         )
+        return cur.lastrowid
 
 
 def get_goals(subject=None, exam_type=None, status=None, order_by_deadline=True):
@@ -165,24 +164,9 @@ def get_goals(subject=None, exam_type=None, status=None, order_by_deadline=True)
     if status and status != "All":
         query += " AND status = ?"
         params.append(status)
-    if order_by_deadline:
-        query += " ORDER BY deadline ASC"
+    query += " ORDER BY deadline ASC" if order_by_deadline else " ORDER BY id DESC"
     with get_conn() as conn:
-        rows = conn.execute(query, params).fetchall()
-    return [dict(r) for r in rows]
-
-
-def get_distinct_subjects():
-    with get_conn() as conn:
-        rows = conn.execute("SELECT DISTINCT subject FROM goals ORDER BY subject ASC").fetchall()
-    return [r["subject"] for r in rows]
-
-
-def delete_goal(goal_id):
-    with get_conn() as conn:
-        conn.execute("DELETE FROM goals WHERE id = ?", (goal_id,))
-        # Keep historical study time entries, just detach them from the deleted goal.
-        conn.execute("UPDATE study_logs SET goal_id = NULL WHERE goal_id = ?", (goal_id,))
+        return [dict(row) for row in conn.execute(query, params)]
 
 
 def get_goal_by_id(goal_id):
@@ -191,30 +175,90 @@ def get_goal_by_id(goal_id):
     return dict(row) if row else None
 
 
-# ---- Spaced repetition -----------------------------------------------------
+def get_distinct_subjects():
+    with get_conn() as conn:
+        rows = conn.execute("SELECT DISTINCT subject FROM goals ORDER BY subject").fetchall()
+    return [row["subject"] for row in rows]
 
-def mark_goal_completed(goal_id):
-    """Mark a goal Completed and kick off the SRS schedule (+1 / +3 / +7 days)."""
+
+def update_goal(goal_id, subject, topic, deadline_dt, priority, status, exam_type, notes):
+    old = get_goal_by_id(goal_id)
+    if not old:
+        return False
+
     now = datetime.now()
-    first_review = (now.date() + timedelta(days=SRS_INTERVALS[1])).isoformat()
+    completed_at = old.get("completed_at")
+    review_stage = old.get("review_stage") or 0
+    next_review_date = old.get("next_review_date")
+
+    if status == "Pending":
+        completed_at = None
+        review_stage = 0
+        next_review_date = None
+    elif old["status"] != "Completed" and status == "Completed":
+        completed_at = now.isoformat(sep=" ")
+        review_stage = 1
+        next_review_date = (now.date() + timedelta(days=1)).isoformat()
+    elif status == "Completed" and not completed_at:
+        completed_at = now.isoformat(sep=" ")
+        review_stage = 1
+        next_review_date = (now.date() + timedelta(days=1)).isoformat()
+
     with get_conn() as conn:
         conn.execute(
             """
             UPDATE goals
-            SET status = 'Completed', completed_at = ?, review_stage = 1, next_review_date = ?
+            SET subject = ?, topic = ?, deadline = ?, priority = ?, status = ?,
+                exam_type = ?, notes = ?, completed_at = ?,
+                next_review_date = ?, review_stage = ?
             WHERE id = ?
             """,
-            (now.isoformat(sep=" "), first_review, goal_id),
+            (
+                subject.strip(), topic.strip(), deadline_dt.isoformat(sep=" "),
+                priority, status, exam_type, notes,
+                completed_at, next_review_date, review_stage, goal_id,
+            ),
+        )
+    return True
+
+
+def delete_goal(goal_id):
+    # Keep historical study time; detach it before deleting the goal.
+    with get_conn() as conn:
+        conn.execute("UPDATE study_logs SET goal_id = NULL WHERE goal_id = ?", (goal_id,))
+        conn.execute("DELETE FROM goals WHERE id = ?", (goal_id,))
+
+
+def save_goal_notes(goal_id, notes):
+    with get_conn() as conn:
+        conn.execute("UPDATE goals SET notes = ? WHERE id = ?", (notes, goal_id))
+
+
+# =============================================================================
+# SRS
+# =============================================================================
+
+def mark_goal_completed(goal_id):
+    now = datetime.now()
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE goals
+            SET status = 'Completed', completed_at = ?, review_stage = 1,
+                next_review_date = ?
+            WHERE id = ?
+            """,
+            (now.isoformat(sep=" "), (now.date() + timedelta(days=1)).isoformat(), goal_id),
         )
 
 
 def reopen_goal(goal_id):
-    """Move a goal back to Pending and clear any SRS scheduling."""
     with get_conn() as conn:
         conn.execute(
             """
             UPDATE goals
-            SET status = 'Pending', completed_at = NULL, review_stage = 0, next_review_date = NULL
+            SET status = 'Pending', completed_at = NULL, review_stage = 0,
+                next_review_date = NULL
             WHERE id = ?
             """,
             (goal_id,),
@@ -222,12 +266,13 @@ def reopen_goal(goal_id):
 
 
 def advance_review(goal_id):
-    """Mark the current review cycle as done and roll forward to the next interval."""
     goal = get_goal_by_id(goal_id)
     if not goal or not goal.get("completed_at"):
         return
+
     next_stage = (goal.get("review_stage") or 0) + 1
     completed_date = datetime.fromisoformat(goal["completed_at"]).date()
+
     with get_conn() as conn:
         if next_stage in SRS_INTERVALS:
             next_date = (completed_date + timedelta(days=SRS_INTERVALS[next_stage])).isoformat()
@@ -236,7 +281,6 @@ def advance_review(goal_id):
                 (next_stage, next_date, goal_id),
             )
         else:
-            # All three review cycles are done.
             conn.execute(
                 "UPDATE goals SET review_stage = 4, next_review_date = NULL WHERE id = ?",
                 (goal_id,),
@@ -244,38 +288,42 @@ def advance_review(goal_id):
 
 
 def get_revision_queue():
-    """Goals whose next scheduled review is today or earlier (due/overdue)."""
     today = date.today().isoformat()
     with get_conn() as conn:
         rows = conn.execute(
             """
             SELECT * FROM goals
-            WHERE review_stage BETWEEN 1 AND 3 AND next_review_date IS NOT NULL
+            WHERE status = 'Completed'
+              AND review_stage BETWEEN 1 AND 3
+              AND next_review_date IS NOT NULL
               AND next_review_date <= ?
             ORDER BY next_review_date ASC
             """,
             (today,),
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [dict(row) for row in rows]
 
 
 def get_upcoming_reviews():
-    """Goals with a review scheduled for a future date (not yet due)."""
     today = date.today().isoformat()
     with get_conn() as conn:
         rows = conn.execute(
             """
             SELECT * FROM goals
-            WHERE review_stage BETWEEN 1 AND 3 AND next_review_date IS NOT NULL
+            WHERE status = 'Completed'
+              AND review_stage BETWEEN 1 AND 3
+              AND next_review_date IS NOT NULL
               AND next_review_date > ?
             ORDER BY next_review_date ASC
             """,
             (today,),
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [dict(row) for row in rows]
 
 
-# ---- Resources --------------------------------------------------------------
+# =============================================================================
+# Resources
+# =============================================================================
 
 def add_resource(goal_id, file_name, file_path, file_type):
     with get_conn() as conn:
@@ -301,8 +349,7 @@ def get_resources(goal_id=None):
         params.append(goal_id)
     query += " ORDER BY resources.id DESC"
     with get_conn() as conn:
-        rows = conn.execute(query, params).fetchall()
-    return [dict(r) for r in rows]
+        return [dict(row) for row in conn.execute(query, params)]
 
 
 def delete_resource(resource_id):
@@ -316,7 +363,31 @@ def delete_resource(resource_id):
             pass
 
 
-# ---- Study logs ---------------------------------------------------------------
+def human_file_size(num_bytes):
+    size = float(num_bytes)
+    for unit in ["B", "KB", "MB", "GB"]:
+        if size < 1024:
+            return f"{size:.0f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def open_file_on_server(path):
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+# =============================================================================
+# Study logs / statistics
+# =============================================================================
 
 def add_study_log(subject, duration_minutes, topic=None, goal_id=None, log_dt=None):
     log_dt = log_dt or datetime.now()
@@ -327,34 +398,33 @@ def add_study_log(subject, duration_minutes, topic=None, goal_id=None, log_dt=No
             VALUES (?, ?, ?, ?, ?)
             """,
             (
-                subject.strip(),
-                int(duration_minutes),
-                log_dt.isoformat(sep=" "),
-                topic.strip() if topic else None,
-                goal_id,
+                subject.strip(), int(duration_minutes), log_dt.isoformat(sep=" "),
+                topic.strip() if topic else None, goal_id,
             ),
         )
 
 
 def get_study_logs(limit=50):
     with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM study_logs ORDER BY log_date DESC LIMIT ?", (limit,)
-        ).fetchall()
-    return [dict(r) for r in rows]
+        return [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM study_logs ORDER BY log_date DESC LIMIT ?", (limit,)
+            )
+        ]
 
 
 def get_total_minutes_today():
-    today_str = date.today().isoformat()
+    today = date.today().isoformat()
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT COALESCE(SUM(duration_minutes), 0) AS total FROM study_logs WHERE log_date LIKE ?",
-            (f"{today_str}%",),
+            "SELECT COALESCE(SUM(duration_minutes), 0) AS total FROM study_logs WHERE date(log_date) = ?",
+            (today,),
         ).fetchone()
     return row["total"]
 
 
-def get_topic_total_minutes(goal_id=None, subject=None, topic=None):
+def get_topic_total_minutes(subject, topic, goal_id=None):
     with get_conn() as conn:
         if goal_id:
             row = conn.execute(
@@ -364,11 +434,11 @@ def get_topic_total_minutes(goal_id=None, subject=None, topic=None):
         else:
             row = conn.execute(
                 """
-                SELECT COALESCE(SUM(duration_minutes), 0) AS total FROM study_logs
-                WHERE subject = ? AND goal_id IS NULL
-                  AND ((topic IS NULL AND ? IS NULL) OR topic = ?)
+                SELECT COALESCE(SUM(duration_minutes), 0) AS total
+                FROM study_logs
+                WHERE subject = ? AND topic = ?
                 """,
-                (subject, topic, topic),
+                (subject, topic),
             ).fetchone()
     return row["total"]
 
@@ -388,8 +458,8 @@ def get_overall_total_minutes():
     return row["total"]
 
 
-def get_daily_totals(days_back=120):
-    start_date = date.today() - timedelta(days=days_back)
+def get_daily_totals(days_back=365):
+    start = date.today() - timedelta(days=days_back)
     with get_conn() as conn:
         rows = conn.execute(
             """
@@ -397,10 +467,11 @@ def get_daily_totals(days_back=120):
             FROM study_logs
             WHERE date(log_date) >= ?
             GROUP BY day
+            ORDER BY day
             """,
-            (start_date.isoformat(),),
+            (start.isoformat(),),
         ).fetchall()
-    return {r["day"]: r["total"] for r in rows}
+    return {row["day"]: row["total"] for row in rows}
 
 
 def get_subject_totals():
@@ -413,15 +484,46 @@ def get_subject_totals():
             ORDER BY total DESC
             """
         ).fetchall()
-    return [dict(r) for r in rows]
+    return [dict(row) for row in rows]
 
 
-# --------------------------------------------------------------------------
-# Formatting / analytics helpers
-# --------------------------------------------------------------------------
+def format_minutes(minutes):
+    minutes = int(minutes or 0)
+    hours, mins = divmod(minutes, 60)
+    return f"{hours}h {mins}m" if hours else f"{mins}m"
 
-def parse_deadline(deadline_str):
-    return datetime.fromisoformat(deadline_str)
+
+def compute_streaks(daily_totals):
+    active = {datetime.fromisoformat(day).date() for day, mins in daily_totals.items() if mins and mins > 0}
+    if not active:
+        return 0, 0
+
+    today = date.today()
+    cursor = today if today in active else today - timedelta(days=1)
+    current = 0
+    while cursor in active:
+        current += 1
+        cursor -= timedelta(days=1)
+
+    longest = run = 0
+    cursor = min(active)
+    end = max(active)
+    while cursor <= end:
+        if cursor in active:
+            run += 1
+            longest = max(longest, run)
+        else:
+            run = 0
+        cursor += timedelta(days=1)
+    return current, longest
+
+
+# =============================================================================
+# Formatting / calendar export
+# =============================================================================
+
+def parse_deadline(value):
+    return datetime.fromisoformat(value)
 
 
 def urgency_bucket(deadline_dt, now=None):
@@ -429,18 +531,16 @@ def urgency_bucket(deadline_dt, now=None):
     delta = deadline_dt - now
     if delta.total_seconds() < 0:
         return "overdue", delta
-    elif delta.total_seconds() < URGENT_WINDOW_HOURS * 3600:
+    if delta.total_seconds() < 48 * 3600:
         return "urgent", delta
-    else:
-        return "upcoming", delta
+    return "upcoming", delta
 
 
 def format_countdown(delta):
-    """Format a timedelta (may be negative) into a human string like '2d 3h 15m'."""
-    total_seconds = int(delta.total_seconds())
-    sign = "-" if total_seconds < 0 else ""
-    total_seconds = abs(total_seconds)
-    days, rem = divmod(total_seconds, 86400)
+    seconds = int(delta.total_seconds())
+    sign = "-" if seconds < 0 else ""
+    seconds = abs(seconds)
+    days, rem = divmod(seconds, 86400)
     hours, rem = divmod(rem, 3600)
     minutes, _ = divmod(rem, 60)
     parts = []
@@ -452,314 +552,319 @@ def format_countdown(delta):
     return sign + " ".join(parts)
 
 
-def format_minutes(total_minutes):
-    """Format raw minutes into e.g. '2h 5m' or '35m'."""
-    total_minutes = int(total_minutes or 0)
-    hours, minutes = divmod(total_minutes, 60)
-    if hours:
-        return f"{hours}h {minutes}m"
-    return f"{minutes}m"
-
-
 URGENCY_STYLE = {
-    "overdue": {"color": "#ffffff", "bg": "#d9363e", "label": "OVERDUE"},
-    "urgent": {"color": "#ffffff", "bg": "#e08a1e", "label": "URGENT"},
-    "upcoming": {"color": "#ffffff", "bg": "#2f9e44", "label": "UPCOMING"},
+    "overdue": ("#d9363e", "OVERDUE"),
+    "urgent": ("#e08a1e", "URGENT"),
+    "upcoming": ("#2f9e44", "UPCOMING"),
 }
 
 
 def urgency_badge_html(bucket):
-    style = URGENCY_STYLE[bucket]
-    return (
-        f'<span style="background-color:{style["bg"]}; color:{style["color"]}; '
-        f'padding:2px 10px; border-radius:12px; font-size:0.75rem; font-weight:600;">'
-        f'{style["label"]}</span>'
-    )
+    bg, label = URGENCY_STYLE[bucket]
+    return f'<span style="background:{bg};color:#fff;padding:2px 10px;border-radius:12px;font-size:.75rem;font-weight:600">{label}</span>'
 
 
 def priority_badge_html(priority):
-    colors = {"High": "#d9363e", "Medium": "#e08a1e", "Low": "#2f6fb0"}
-    color = colors.get(priority, "#666666")
-    return (
-        f'<span style="border:1px solid {color}; color:{color}; '
-        f'padding:1px 8px; border-radius:10px; font-size:0.72rem; font-weight:600;">'
-        f'{priority}</span>'
-    )
+    color = {"High": "#d9363e", "Medium": "#e08a1e", "Low": "#2f6fb0"}.get(priority, "#666")
+    return f'<span style="border:1px solid {color};color:{color};padding:1px 8px;border-radius:10px;font-size:.72rem;font-weight:600">{priority}</span>'
 
 
-def review_badge_html(stage_label, review_bucket):
-    bg = "#d9363e" if review_bucket == "overdue" else "#7048e8"
-    return (
-        f'<span style="background-color:{bg}; color:#fff; padding:1px 8px; '
-        f'border-radius:10px; font-size:0.72rem; font-weight:600;">🔁 {stage_label}</span>'
-    )
-
-
-def human_file_size(num_bytes):
-    for unit in ["B", "KB", "MB", "GB"]:
-        if num_bytes < 1024:
-            return f"{num_bytes:.0f} {unit}"
-        num_bytes /= 1024
-    return f"{num_bytes:.1f} TB"
-
-
-def open_file_on_server(path):
-    """Attempt to open a file with the host OS's default application.
-    Only meaningful when Streamlit is running locally on the user's own machine."""
-    try:
-        if sys.platform.startswith("win"):
-            os.startfile(path)  # type: ignore[attr-defined]
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", path])
-        else:
-            subprocess.Popen(["xdg-open", path])
-        return True, None
-    except Exception as exc:  # noqa: BLE001
-        return False, str(exc)
-
-
-def compute_streaks(daily_totals):
-    """daily_totals: dict of 'YYYY-MM-DD' -> minutes. Returns (current_streak, longest_streak)."""
-    active_days = {
-        datetime.fromisoformat(day).date() for day, minutes in daily_totals.items() if minutes and minutes > 0
-    }
-    if not active_days:
-        return 0, 0
-
-    today = date.today()
-    cursor = today if today in active_days else today - timedelta(days=1)
-    current = 0
-    while cursor in active_days:
-        current += 1
-        cursor -= timedelta(days=1)
-
-    longest = 0
-    run = 0
-    d = min(active_days)
-    end = max(active_days)
-    while d <= end:
-        if d in active_days:
-            run += 1
-            longest = max(longest, run)
-        else:
-            run = 0
-        d += timedelta(days=1)
-
-    return current, longest
+def review_badge_html(stage_label, overdue=False):
+    bg = "#d9363e" if overdue else "#7048e8"
+    return f'<span style="background:{bg};color:#fff;padding:1px 8px;border-radius:10px;font-size:.72rem;font-weight:600">🔁 {stage_label}</span>'
 
 
 def generate_ics_bytes():
-    """Build an .ics calendar file with all goal deadlines and pending SRS review dates."""
+    """Export exam deadlines plus completion/revision milestone dates."""
     cal = Calendar()
-    cal.add("prodid", "-//Exam Study and Goal Tracker//streamlit-app//")
+    cal.add("prodid", "-//Exam Study and Goal Tracker//")
     cal.add("version", "2.0")
 
-    goals = get_goals(order_by_deadline=False)
-    for g in goals:
+    for goal in get_goals(order_by_deadline=False):
+        deadline = parse_deadline(goal["deadline"])
         event = Event()
-        event.add("summary", f"{g['subject']}: {g['topic']} ({g['exam_type']})")
-        deadline_dt = parse_deadline(g["deadline"])
-        event.add("dtstart", deadline_dt)
-        event.add("dtend", deadline_dt + timedelta(hours=1))
+        event.add("summary", f"EXAM: {goal['subject']} — {goal['topic']} ({goal['exam_type']})")
+        event.add("dtstart", deadline)
+        event.add("dtend", deadline + timedelta(hours=1))
         event.add("dtstamp", datetime.now())
-        event.add("description", f"Priority: {g['priority']} | Status: {g['status']}")
-        event.add("uid", f"goal-{g['id']}@exam-study-tracker")
+        event.add("description", f"Priority: {goal['priority']} | Status: {goal['status']}")
+        event.add("uid", f"goal-{goal['id']}@exam-study-tracker")
         cal.add_component(event)
 
-        stage = g.get("review_stage") or 0
-        if 1 <= stage <= 3 and g.get("next_review_date"):
+        if goal.get("completed_at"):
+            completed = datetime.fromisoformat(goal["completed_at"])
+            milestone = Event()
+            milestone.add("summary", f"MILESTONE: Completed — {goal['subject']} / {goal['topic']}")
+            milestone.add("dtstart", completed)
+            milestone.add("dtend", completed + timedelta(minutes=15))
+            milestone.add("dtstamp", datetime.now())
+            milestone.add("uid", f"completed-{goal['id']}@exam-study-tracker")
+            cal.add_component(milestone)
+
+        stage = goal.get("review_stage") or 0
+        if 1 <= stage <= 3 and goal.get("next_review_date"):
             review = Event()
-            review.add(
-                "summary",
-                f"Revise: {g['subject']} / {g['topic']} ({SRS_STAGE_LABELS.get(stage, 'Review')})",
-            )
-            review.add("dtstart", date.fromisoformat(g["next_review_date"]))
+            review.add("summary", f"REVIEW: {goal['subject']} — {goal['topic']} ({SRS_STAGE_LABELS[stage]})")
+            review.add("dtstart", date.fromisoformat(goal["next_review_date"]))
             review.add("dtstamp", datetime.now())
-            review.add("description", "Spaced-repetition revision reminder")
-            review.add("uid", f"review-{g['id']}-{stage}@exam-study-tracker")
+            review.add("description", "Spaced-repetition revision milestone")
+            review.add("uid", f"review-{goal['id']}-{stage}@exam-study-tracker")
             cal.add_component(review)
 
     return cal.to_ical()
 
 
-# --------------------------------------------------------------------------
-# UI: Dashboard
-# --------------------------------------------------------------------------
+# =============================================================================
+# Goal notes / editing UI
+# =============================================================================
+
+def render_goal_notes(goal):
+    with st.expander("📝 Notes / formulas / doubts", expanded=False):
+        notes_key = f"notes_{goal['id']}"
+        if notes_key not in st.session_state:
+            st.session_state[notes_key] = goal.get("notes") or ""
+        edited = st.text_area(
+            "Markdown editor",
+            key=notes_key,
+            height=180,
+            placeholder="## Key formulas\n- Formula 1\n\n## Doubts\n- Clarify...",
+            label_visibility="collapsed",
+        )
+        if st.button("💾 Save Notes", key=f"save_notes_{goal['id']}"):
+            save_goal_notes(goal["id"], edited)
+            st.success("Notes saved.")
+        if edited.strip():
+            st.markdown("**Preview**")
+            st.markdown(edited)
+        else:
+            st.caption("No notes saved for this goal yet.")
+
+
+def render_edit_goal(goal_id):
+    st.header("✏️ Edit Goal")
+    goal = get_goal_by_id(goal_id)
+    if not goal:
+        st.error("That goal no longer exists.")
+        return
+
+    deadline_dt = parse_deadline(goal["deadline"])
+    st.caption(f"Editing #{goal['id']} — {goal['subject']} / {goal['topic']}")
+
+    with st.form(f"edit_goal_form_{goal_id}"):
+        c1, c2 = st.columns(2)
+        with c1:
+            subject = st.text_input("Subject", value=goal["subject"])
+            topic = st.text_input("Topic", value=goal["topic"])
+            exam_type = st.selectbox("Exam Type", EXAM_TYPES, index=EXAM_TYPES.index(goal["exam_type"]) if goal["exam_type"] in EXAM_TYPES else 0)
+            deadline_date = st.date_input("Deadline Date", value=deadline_dt.date())
+        with c2:
+            priority = st.selectbox("Priority", PRIORITIES, index=PRIORITIES.index(goal["priority"]) if goal["priority"] in PRIORITIES else 1)
+            status = st.selectbox("Status", STATUSES, index=STATUSES.index(goal["status"]) if goal["status"] in STATUSES else 0)
+            deadline_time = st.time_input("Deadline Time", value=deadline_dt.time())
+            notes = st.text_area("Notes (Markdown)", value=goal.get("notes") or "", height=180)
+
+        save = st.form_submit_button("💾 Save Changes", type="primary", use_container_width=True)
+
+    if save:
+        if not subject.strip() or not topic.strip():
+            st.error("Subject and Topic are required.")
+        else:
+            update_goal(
+                goal_id, subject, topic,
+                datetime.combine(deadline_date, deadline_time),
+                priority, status, exam_type, notes,
+            )
+            st.success("Goal updated successfully.")
+            st.session_state.edit_goal_id = goal_id
+            st.rerun()
+
+    st.divider()
+    st.subheader("Danger Zone")
+    confirm = st.checkbox("I understand that deleting this goal cannot be undone.", key=f"confirm_delete_{goal_id}")
+    if st.button("🗑️ Delete Goal", disabled=not confirm, key=f"delete_edit_{goal_id}"):
+        delete_goal(goal_id)
+        st.session_state.edit_goal_id = None
+        st.success("Goal deleted.")
+        st.rerun()
+
+
+def render_goal_editor_page():
+    goals = get_goals(order_by_deadline=False)
+    if not goals:
+        st.header("✏️ Edit Goal")
+        st.info("No goals exist yet. Add a goal first.")
+        return
+
+    labels = {g["id"]: f"#{g['id']} — {g['subject']} / {g['topic']}" for g in goals}
+    current = st.session_state.get("edit_goal_id")
+    ids = list(labels)
+    default_index = ids.index(current) if current in ids else 0
+    selected = st.selectbox("Select a goal to edit", ids, index=default_index, format_func=lambda x: labels[x])
+    st.session_state.edit_goal_id = selected
+    render_edit_goal(selected)
+
+
+# =============================================================================
+# Dashboard
+# =============================================================================
 
 def render_dashboard():
     st.header("📊 Dashboard")
 
-    top_col1, top_col2 = st.columns([3, 1])
-    with top_col2:
-        st.download_button(
-            "📅 Export to Calendar (.ics)",
-            data=generate_ics_bytes(),
-            file_name="study_tracker_export.ics",
-            mime="text/calendar",
-            use_container_width=True,
-        )
+    c1, c2, c3, c4 = st.columns(4)
+    all_goals = get_goals(order_by_deadline=False)
+    pending = [g for g in all_goals if g["status"] == "Pending"]
+    c1.metric("Total Goals", len(all_goals))
+    c2.metric("Pending", len(pending))
+    c3.metric("Reviews Due", len(get_revision_queue()))
+    c4.metric("Study Today", format_minutes(get_total_minutes_today()))
+
+    st.download_button(
+        "📅 Export Deadlines & Milestones (.ics)",
+        data=generate_ics_bytes(),
+        file_name="study_tracker_export.ics",
+        mime="text/calendar",
+        use_container_width=True,
+    )
 
     subjects = ["All"] + get_distinct_subjects()
-    col_f1, col_f2, col_f3 = st.columns([1, 1, 1])
-    with col_f1:
+    f1, f2, f3 = st.columns(3)
+    with f1:
         subject_filter = st.selectbox("Filter by Subject", subjects, key="dash_subject")
-    with col_f2:
+    with f2:
         exam_filter = st.selectbox("Filter by Exam Type", ["All"] + EXAM_TYPES, key="dash_exam")
-    with col_f3:
-        show_completed = st.checkbox("Show completed goals too", value=False)
+    with f3:
+        status_filter = st.selectbox("Status", ["All", "Pending", "Completed"], index=1, key="dash_status")
 
-    status_filter = "All" if show_completed else "Pending"
-    goals = get_goals(subject=subject_filter, exam_type=exam_filter, status=status_filter)
-
+    goals = get_goals(subject_filter, exam_filter, status_filter)
     st.subheader("Goals")
+
     if not goals:
-        st.info("No goals match the current filters. Add one from the 'Add Goal' tab.")
+        st.info("No goals match the current filters. Add a goal from the sidebar.")
     else:
         now = datetime.now()
         today = date.today()
         for goal in goals:
-            deadline_dt = parse_deadline(goal["deadline"])
-            bucket, delta = urgency_bucket(deadline_dt, now)
-            is_completed = goal["status"] == "Completed"
+            deadline = parse_deadline(goal["deadline"])
+            bucket, delta = urgency_bucket(deadline, now)
+            completed = goal["status"] == "Completed"
 
             with st.container(border=True):
-                top_col1, top_col2 = st.columns([4, 1])
-                with top_col1:
-                    title_html = f'<span style="font-size:1.05rem; font-weight:700;">{goal["subject"]} — {goal["topic"]}</span>'
-                    st.markdown(title_html, unsafe_allow_html=True)
-                    badges = ""
-                    if not is_completed:
-                        badges += urgency_badge_html(bucket) + "&nbsp;&nbsp;"
-                    badges += priority_badge_html(goal["priority"]) + "&nbsp;&nbsp;"
-                    badges += (
-                        f'<span style="background-color:#444; color:#fff; padding:1px 8px; '
-                        f'border-radius:10px; font-size:0.72rem;">{goal["exam_type"]}</span>'
-                    )
-                    if is_completed:
-                        badges += (
-                            '&nbsp;&nbsp;<span style="background-color:#2f6fb0; color:#fff; '
-                            'padding:1px 8px; border-radius:10px; font-size:0.72rem;">COMPLETED</span>'
-                        )
-                        stage = goal.get("review_stage") or 0
-                        if 1 <= stage <= 3 and goal.get("next_review_date"):
-                            review_due = date.fromisoformat(goal["next_review_date"])
-                            review_bucket = "overdue" if review_due <= today else "upcoming"
-                            badges += "&nbsp;&nbsp;" + review_badge_html(SRS_STAGE_LABELS[stage], review_bucket)
+                top, actions = st.columns([4, 1])
+                with top:
+                    st.markdown(f"### {goal['subject']} — {goal['topic']}")
+                    badges = priority_badge_html(goal["priority"])
+                    badges += f'&nbsp;&nbsp;<span style="background:#444;color:#fff;padding:1px 8px;border-radius:10px;font-size:.72rem">{goal["exam_type"]}</span>'
+                    if not completed:
+                        badges += "&nbsp;&nbsp;" + urgency_badge_html(bucket)
+                    else:
+                        badges += '&nbsp;&nbsp;<span style="background:#2f6fb0;color:#fff;padding:1px 8px;border-radius:10px;font-size:.72rem">COMPLETED</span>'
                     st.markdown(badges, unsafe_allow_html=True)
-                    st.caption(f"Deadline: {deadline_dt.strftime('%a, %d %b %Y  %I:%M %p')}")
-                    if not is_completed:
-                        countdown_text = format_countdown(delta)
+                    st.caption(f"Deadline: {deadline.strftime('%a, %d %b %Y %I:%M %p')}")
+
+                    if not completed:
                         if bucket == "overdue":
-                            st.markdown(f"**Time overdue by:** `{countdown_text.lstrip('-')}`")
+                            st.markdown(f"**Overdue by:** `{format_countdown(delta).lstrip('-')}`")
                         else:
-                            st.markdown(f"**Time remaining:** `{countdown_text}`")
+                            st.markdown(f"**Time remaining:** `{format_countdown(delta)}`")
                     elif goal.get("next_review_date") and 1 <= (goal.get("review_stage") or 0) <= 3:
-                        review_due = date.fromisoformat(goal["next_review_date"])
-                        st.caption(f"Next revision due: {review_due.strftime('%a, %d %b %Y')}")
-                with top_col2:
-                    if not is_completed:
-                        if st.button("✅ Mark Completed", key=f"complete_{goal['id']}"):
+                        review_date = date.fromisoformat(goal["next_review_date"])
+                        overdue = review_date <= today
+                        st.markdown(review_badge_html(SRS_STAGE_LABELS[goal["review_stage"]], overdue), unsafe_allow_html=True)
+                        st.caption(f"Next revision due: {review_date.strftime('%a, %d %b %Y')}")
+
+                    render_goal_notes(goal)
+
+                with actions:
+                    if st.button("✏️ Edit", key=f"edit_{goal['id']}", use_container_width=True):
+                        st.session_state.edit_goal_id = goal["id"]
+                        st.session_state.page = "Edit Goal"
+                        st.rerun()
+                    if not completed:
+                        if st.button("✅ Complete", key=f"complete_{goal['id']}", use_container_width=True):
                             mark_goal_completed(goal["id"])
                             st.rerun()
                     else:
-                        if st.button("↩️ Reopen", key=f"reopen_{goal['id']}"):
+                        if st.button("↩️ Reopen", key=f"reopen_{goal['id']}", use_container_width=True):
                             reopen_goal(goal["id"])
                             st.rerun()
-                    if st.button("🗑️ Delete", key=f"delete_{goal['id']}"):
+                    if st.button("🗑️ Delete", key=f"delete_{goal['id']}", use_container_width=True):
                         delete_goal(goal["id"])
                         st.rerun()
 
     st.divider()
     st.subheader("📈 Syllabus Completion by Subject")
-    all_goals = get_goals(order_by_deadline=False)
     if not all_goals:
-        st.caption("No goals yet — progress will appear here once you add some.")
+        st.caption("No goals yet.")
     else:
         df = pd.DataFrame(all_goals)
-        summary = (
-            df.groupby("subject")["status"]
-            .apply(lambda s: (s == "Completed").sum() / len(s))
-            .reset_index(name="pct")
-        )
+        summary = df.groupby("subject")["status"].apply(lambda s: (s == "Completed").mean()).reset_index(name="pct")
         for _, row in summary.iterrows():
-            pct = row["pct"]
-            st.write(f"**{row['subject']}** — {pct * 100:.0f}% complete")
-            st.progress(min(max(pct, 0.0), 1.0))
+            st.write(f"**{row['subject']}** — {row['pct'] * 100:.0f}% complete")
+            st.progress(float(row["pct"]))
 
 
-# --------------------------------------------------------------------------
-# UI: Add Goal
-# --------------------------------------------------------------------------
+# =============================================================================
+# Add Goal
+# =============================================================================
 
 def render_add_goal():
     st.header("➕ Add a New Goal")
     with st.form("add_goal_form", clear_on_submit=True):
-        col1, col2 = st.columns(2)
-        with col1:
+        c1, c2 = st.columns(2)
+        with c1:
             subject = st.text_input("Subject", placeholder="e.g. Data Structures")
+            topic = st.text_input("Topic", placeholder="e.g. Binary Search Trees")
             exam_type = st.selectbox("Exam Type", EXAM_TYPES)
             deadline_date = st.date_input("Deadline Date", value=date.today() + timedelta(days=7))
-        with col2:
-            topic = st.text_input("Topic", placeholder="e.g. Binary Search Trees")
+        with c2:
             priority = st.selectbox("Priority", PRIORITIES)
             deadline_time = st.time_input("Deadline Time", value=dtime(23, 59))
+            notes = st.text_area("Notes / formulas / doubts (Markdown)", height=180)
 
-        submitted = st.form_submit_button("Add Goal", use_container_width=True)
-        if submitted:
-            if not subject.strip() or not topic.strip():
-                st.error("Subject and Topic are required.")
-            else:
-                deadline_dt = datetime.combine(deadline_date, deadline_time)
-                add_goal(subject, topic, deadline_dt, priority, exam_type)
-                st.success(f"Goal '{topic}' added for {subject}.")
+        submitted = st.form_submit_button("Add Goal", type="primary", use_container_width=True)
+
+    if submitted:
+        if not subject.strip() or not topic.strip():
+            st.error("Subject and Topic are required.")
+        else:
+            add_goal(subject, topic, datetime.combine(deadline_date, deadline_time), priority, exam_type, notes)
+            st.success(f"Goal '{topic}' added for {subject}.")
 
 
-# --------------------------------------------------------------------------
-# UI: Resources
-# --------------------------------------------------------------------------
+# =============================================================================
+# Resources
+# =============================================================================
 
 def render_resources():
     st.header("📎 Resource Attachments")
-
     goals = get_goals(order_by_deadline=False)
     if not goals:
-        st.warning("Add at least one goal first, then attach resources to it here.")
+        st.warning("Add at least one goal first, then attach resources here.")
         return
 
-    goal_labels = {g["id"]: f'#{g["id"]} — {g["subject"]} / {g["topic"]}' for g in goals}
+    labels = {g["id"]: f"#{g['id']} — {g['subject']} / {g['topic']}" for g in goals}
 
-    st.subheader("Upload a Resource")
     with st.form("upload_resource_form", clear_on_submit=True):
-        goal_id = st.selectbox(
-            "Link to Goal", options=list(goal_labels.keys()), format_func=lambda gid: goal_labels[gid]
-        )
+        goal_id = st.selectbox("Link to Goal", list(labels), format_func=lambda x: labels[x])
         file_type = st.selectbox("Resource Type", RESOURCE_TYPES)
-        uploaded_file = st.file_uploader(
-            "Choose a file (PDF, PPT/PPTX, or image)",
-            type=["pdf", "ppt", "pptx", "png", "jpg", "jpeg"],
-        )
-        upload_submitted = st.form_submit_button("Upload", use_container_width=True)
-        if upload_submitted:
-            if uploaded_file is None:
-                st.error("Please choose a file to upload.")
-            else:
-                unique_prefix = uuid.uuid4().hex[:8]
-                safe_name = f"{goal_id}_{unique_prefix}_{uploaded_file.name}"
-                save_path = os.path.join(UPLOAD_DIR, safe_name)
-                with open(save_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-                add_resource(goal_id, uploaded_file.name, save_path, file_type)
-                st.success(f"Uploaded '{uploaded_file.name}' and linked it to goal #{goal_id}.")
+        uploaded = st.file_uploader("Choose a file", type=["pdf", "ppt", "pptx", "png", "jpg", "jpeg"])
+        submitted = st.form_submit_button("Upload", use_container_width=True)
+
+    if submitted:
+        if uploaded is None:
+            st.error("Please choose a file.")
+        else:
+            safe_name = f"{goal_id}_{uuid.uuid4().hex[:8]}_{uploaded.name}"
+            path = os.path.join(UPLOAD_DIR, safe_name)
+            with open(path, "wb") as f:
+                f.write(uploaded.getbuffer())
+            add_resource(goal_id, uploaded.name, path, file_type)
+            st.success(f"Uploaded '{uploaded.name}'.")
 
     st.divider()
-    st.subheader("Attached Files")
-
-    filter_goal = st.selectbox(
-        "Filter by Goal",
-        options=["All"] + list(goal_labels.keys()),
-        format_func=lambda gid: "All Goals" if gid == "All" else goal_labels[gid],
-    )
-    resources = get_resources(goal_id=None if filter_goal == "All" else filter_goal)
+    filter_goal = st.selectbox("Filter by Goal", ["All"] + list(labels), format_func=lambda x: "All Goals" if x == "All" else labels[x])
+    resources = get_resources(None if filter_goal == "All" else filter_goal)
 
     if not resources:
         st.info("No resources uploaded yet.")
@@ -769,389 +874,337 @@ def render_resources():
         with st.container(border=True):
             c1, c2, c3, c4 = st.columns([3, 1, 1, 1])
             with c1:
-                subj_label = (
-                    f'{res["goal_subject"]} / {res["goal_topic"]}' if res["goal_subject"] else "Unlinked"
-                )
-                st.markdown(f"**{res['file_name']}**  \n`{res['file_type']}` — {subj_label}")
+                linked = f"{res['goal_subject']} / {res['goal_topic']}" if res["goal_subject"] else "Unlinked"
+                st.markdown(f"**{res['file_name']}**  \n`{res['file_type']}` — {linked}")
             with c2:
                 if os.path.exists(res["file_path"]):
-                    size = human_file_size(os.path.getsize(res["file_path"]))
-                    st.caption(size)
+                    st.caption(human_file_size(os.path.getsize(res["file_path"])))
                     with open(res["file_path"], "rb") as f:
-                        st.download_button(
-                            "⬇️ Download",
-                            data=f.read(),
-                            file_name=res["file_name"],
-                            key=f"dl_{res['id']}",
-                        )
+                        st.download_button("⬇️ Download", f.read(), file_name=res["file_name"], key=f"dl_{res['id']}")
                 else:
-                    st.caption("File missing on disk")
+                    st.caption("File missing")
             with c3:
-                if st.button("🖥️ Open on server", key=f"open_{res['id']}"):
+                if st.button("🖥️ Open", key=f"open_{res['id']}"):
                     ok, err = open_file_on_server(res["file_path"])
                     if ok:
-                        st.success("Opened on the server's default application.")
+                        st.success("Opened.")
                     else:
-                        st.error(f"Could not open file: {err}")
+                        st.error(err)
             with c4:
                 if st.button("🗑️ Remove", key=f"del_res_{res['id']}"):
                     delete_resource(res["id"])
                     st.rerun()
 
 
-# --------------------------------------------------------------------------
-# UI: Focus Timer (topic-level)
-# --------------------------------------------------------------------------
+# =============================================================================
+# Focus Timer
+# =============================================================================
 
 def init_timer_state():
     defaults = {
         "timer_running": False,
         "timer_end": None,
+        "timer_start": None,
         "timer_subject": "",
         "timer_topic": None,
         "timer_goal_id": None,
         "timer_duration_min": 25,
-        "timer_start": None,
     }
-    for key, val in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
 
 
 def render_time_stats(subject, topic, goal_id):
-    topic_total = get_topic_total_minutes(goal_id=goal_id, subject=subject, topic=topic)
+    topic_total = get_topic_total_minutes(subject, topic, goal_id) if topic else 0
     subject_total = get_subject_total_minutes(subject) if subject else 0
-    overall_total = get_overall_total_minutes()
-
+    overall = get_overall_total_minutes()
     c1, c2, c3 = st.columns(3)
     c1.metric("Topic Total", format_minutes(topic_total))
     c2.metric("Subject Total", format_minutes(subject_total))
-    c3.metric("Overall Study Time", format_minutes(overall_total))
+    c3.metric("Grand Total", format_minutes(overall))
+
+
+def clear_timer_state():
+    st.session_state.timer_running = False
+    st.session_state.timer_end = None
+    st.session_state.timer_start = None
+    st.session_state.timer_subject = ""
+    st.session_state.timer_topic = None
+    st.session_state.timer_goal_id = None
 
 
 def render_focus_timer():
-    st.header("⏱️ Focus Timer (Topic-Level Tracking)")
+    st.header("⏱️ Focus Timer")
+    st.caption("Select a subject and specific topic before starting. Every completed session is stored in SQLite.")
     init_timer_state()
 
-    subjects = get_distinct_subjects()
-
     if not st.session_state.timer_running:
-        col1, col2 = st.columns(2)
-        with col1:
+        subjects = get_distinct_subjects()
+        c1, c2 = st.columns(2)
+
+        with c1:
             if subjects:
-                subject_choice = st.selectbox("Subject", subjects + ["Other (type below)"])
+                subject_choice = st.selectbox("Subject", subjects + ["Other (type below)"], key="timer_subject_choice")
                 if subject_choice == "Other (type below)":
-                    subject_input = st.text_input("Enter subject name", key="timer_subject_manual")
+                    subject = st.text_input("Enter subject", key="timer_subject_manual")
                 else:
-                    subject_input = subject_choice
+                    subject = subject_choice
             else:
-                subject_input = st.text_input("Subject", key="timer_subject_manual")
+                subject = st.text_input("Subject", key="timer_subject_manual")
 
-        goal_id = None
-        topic_input = None
-        with col2:
-            subject_goals = get_goals(subject=subject_input, order_by_deadline=False) if subject_input else []
+        with c2:
+            subject_goals = get_goals(subject=subject, order_by_deadline=False) if subject else []
+            goal_id = None
+            topic = None
             if subject_goals:
-                topic_options = {g["id"]: f'{g["topic"]} ({g["status"]})' for g in subject_goals}
-                topic_options[None] = "General (no specific topic)"
-                topic_choice = st.selectbox(
-                    "Topic / Goal",
-                    options=list(topic_options.keys()),
-                    format_func=lambda k: topic_options[k],
-                )
-                if topic_choice is None:
-                    topic_input = st.text_input("Or type a free-form topic (optional)", key="timer_topic_manual")
+                options = {g["id"]: f"{g['topic']} ({g['status']})" for g in subject_goals}
+                options[None] = "General / no specific goal"
+                selected = st.selectbox("Topic / Goal", list(options), format_func=lambda x: options[x], key="timer_goal_choice")
+                if selected is None:
+                    topic = st.text_input("Free-form topic", key="timer_topic_manual")
                 else:
-                    goal_id = topic_choice
-                    topic_input = next(g["topic"] for g in subject_goals if g["id"] == topic_choice)
+                    goal_id = selected
+                    topic = next(g["topic"] for g in subject_goals if g["id"] == selected)
             else:
-                topic_input = st.text_input("Topic (optional)", key="timer_topic_manual")
+                topic = st.text_input("Topic", key="timer_topic_manual")
 
-        if subject_input:
-            st.caption("Current totals for this selection:")
-            render_time_stats(subject_input, topic_input, goal_id)
+        if subject:
+            st.caption("Current totals")
+            render_time_stats(subject, topic, goal_id)
 
-        duration_choice = st.selectbox("Session length (minutes)", [15, 25, 45, 60, "Custom"])
-        if duration_choice == "Custom":
-            duration_min = st.number_input("Custom minutes", min_value=1, max_value=240, value=25)
-        else:
-            duration_min = duration_choice
+        duration_choice = st.selectbox("Session length", [15, 25, 45, 60, "Custom"])
+        duration = st.number_input("Custom minutes", 1, 240, 25) if duration_choice == "Custom" else duration_choice
 
-        if st.button("▶️ Start Focus Session", use_container_width=True, type="primary"):
-            if not subject_input or not subject_input.strip():
-                st.error("Please enter a subject before starting.")
+        if st.button("▶️ Start Focus Session", type="primary", use_container_width=True):
+            if not subject or not subject.strip():
+                st.error("Please select or enter a subject.")
+            elif not topic or not topic.strip():
+                st.error("Please select or enter a topic. Topic-level tracking requires a topic.")
             else:
-                st.session_state.timer_subject = subject_input.strip()
-                st.session_state.timer_topic = topic_input.strip() if topic_input else None
+                st.session_state.timer_subject = subject.strip()
+                st.session_state.timer_topic = topic.strip()
                 st.session_state.timer_goal_id = goal_id
-                st.session_state.timer_duration_min = int(duration_min)
+                st.session_state.timer_duration_min = int(duration)
                 st.session_state.timer_start = datetime.now()
-                st.session_state.timer_end = datetime.now() + timedelta(minutes=int(duration_min))
+                st.session_state.timer_end = datetime.now() + timedelta(minutes=int(duration))
                 st.session_state.timer_running = True
                 st.rerun()
+
     else:
         remaining = st.session_state.timer_end - datetime.now()
-        remaining_seconds = int(remaining.total_seconds())
+        seconds = int(remaining.total_seconds())
+        topic_label = st.session_state.timer_topic
+        st.markdown(f"### Studying: {st.session_state.timer_subject} — {topic_label}")
 
-        topic_label = st.session_state.timer_topic or "General study"
-        st.markdown(f"**Studying:** {st.session_state.timer_subject} — {topic_label}")
-
-        if remaining_seconds <= 0:
+        if seconds <= 0:
             add_study_log(
                 st.session_state.timer_subject,
                 st.session_state.timer_duration_min,
-                topic=st.session_state.timer_topic,
+                topic=topic_label,
                 goal_id=st.session_state.timer_goal_id,
             )
-            st.success(
-                f"Session complete! Logged {st.session_state.timer_duration_min} minutes for "
-                f"{st.session_state.timer_subject} — {topic_label}."
-            )
-            st.session_state.timer_running = False
-            st.session_state.timer_end = None
-            st.session_state.timer_start = None
+            st.success(f"Session complete! Logged {st.session_state.timer_duration_min} minutes.")
             st.balloons()
+            clear_timer_state()
         else:
-            mins, secs = divmod(remaining_seconds, 60)
-            st.markdown(
-                f'<div style="text-align:center; font-size:3.5rem; font-weight:700;">'
-                f"{mins:02d}:{secs:02d}</div>",
-                unsafe_allow_html=True,
-            )
+            mins, secs = divmod(seconds, 60)
+            st.markdown(f'<div style="text-align:center;font-size:3.5rem;font-weight:700">{mins:02d}:{secs:02d}</div>', unsafe_allow_html=True)
             total_seconds = st.session_state.timer_duration_min * 60
-            elapsed_fraction = 1 - (remaining_seconds / total_seconds)
-            st.progress(min(max(elapsed_fraction, 0.0), 1.0))
+            st.progress(min(max(1 - seconds / total_seconds, 0), 1))
 
-            col_a, col_b = st.columns(2)
-            with col_a:
+            c1, c2 = st.columns(2)
+            with c1:
                 if st.button("⏹️ Stop & Log Elapsed Time", use_container_width=True):
-                    elapsed_min = max(
-                        1,
-                        int((datetime.now() - st.session_state.timer_start).total_seconds() // 60),
-                    )
-                    add_study_log(
-                        st.session_state.timer_subject,
-                        elapsed_min,
-                        topic=st.session_state.timer_topic,
-                        goal_id=st.session_state.timer_goal_id,
-                    )
-                    st.success(f"Logged {elapsed_min} minutes for {st.session_state.timer_subject} — {topic_label}.")
-                    st.session_state.timer_running = False
-                    st.session_state.timer_end = None
-                    st.session_state.timer_start = None
+                    elapsed = max(1, int((datetime.now() - st.session_state.timer_start).total_seconds() // 60))
+                    add_study_log(st.session_state.timer_subject, elapsed, topic=topic_label, goal_id=st.session_state.timer_goal_id)
+                    st.success(f"Logged {elapsed} minutes.")
+                    clear_timer_state()
                     st.rerun()
-            with col_b:
-                if st.button("❌ Cancel (no log)", use_container_width=True):
-                    st.session_state.timer_running = False
-                    st.session_state.timer_end = None
-                    st.session_state.timer_start = None
+            with c2:
+                if st.button("❌ Cancel (No Log)", use_container_width=True):
+                    clear_timer_state()
                     st.rerun()
 
             time.sleep(1)
             st.rerun()
 
     st.divider()
-    st.subheader("Overall Snapshot")
     c1, c2 = st.columns(2)
-    c1.metric("Focused minutes today", get_total_minutes_today())
-    c2.metric("Overall study time", format_minutes(get_overall_total_minutes()))
+    c1.metric("Focused Today", format_minutes(get_total_minutes_today()))
+    c2.metric("Grand Total", format_minutes(get_overall_total_minutes()))
 
     st.subheader("Recent Sessions")
-    logs = get_study_logs(limit=15)
+    logs = get_study_logs(20)
     if logs:
         df = pd.DataFrame(logs)[["subject", "topic", "duration_minutes", "log_date"]]
         df.columns = ["Subject", "Topic", "Minutes", "Logged At"]
         df["Topic"] = df["Topic"].fillna("General")
         st.dataframe(df, use_container_width=True, hide_index=True)
     else:
-        st.caption("No focus sessions logged yet. Start one above!")
+        st.caption("No sessions logged yet.")
 
 
-# --------------------------------------------------------------------------
-# UI: Revision Queue (SRS)
-# --------------------------------------------------------------------------
+# =============================================================================
+# Revision Queue
+# =============================================================================
 
 def render_revision_queue():
     st.header("🔁 Revision Queue")
-    st.caption(
-        "When a goal is marked Completed, it's automatically scheduled for spaced-repetition "
-        "review at +1, +3, and +7 days."
-    )
+    st.caption("Completed goals are scheduled automatically for +1, +3 and +7 day reviews.")
 
     due = get_revision_queue()
     today = date.today()
-
     st.subheader("Due Today / Overdue")
     if not due:
-        st.success("Nothing due for revision right now. 🎉")
+        st.success("Nothing due right now. 🎉")
     else:
         for goal in due:
             review_date = date.fromisoformat(goal["next_review_date"])
-            is_overdue = review_date < today
-            stage_label = SRS_STAGE_LABELS.get(goal["review_stage"], "Review")
+            overdue = review_date < today
+            stage = goal["review_stage"]
             with st.container(border=True):
-                col1, col2 = st.columns([4, 1])
-                with col1:
+                c1, c2 = st.columns([4, 1])
+                with c1:
                     st.markdown(f"**{goal['subject']} — {goal['topic']}**")
-                    badge = review_badge_html(stage_label, "overdue" if is_overdue else "upcoming")
-                    st.markdown(badge, unsafe_allow_html=True)
-                    if is_overdue:
-                        st.caption(f"Was due {review_date.strftime('%a, %d %b %Y')} (overdue)")
-                    else:
-                        st.caption(f"Due today: {review_date.strftime('%a, %d %b %Y')}")
-                with col2:
-                    if st.button("✅ Mark Reviewed", key=f"review_done_{goal['id']}"):
+                    st.markdown(review_badge_html(SRS_STAGE_LABELS[stage], overdue), unsafe_allow_html=True)
+                    st.caption((f"Was due {review_date:%a, %d %b %Y} (overdue)" if overdue else f"Due today: {review_date:%a, %d %b %Y}"))
+                    if goal.get("notes"):
+                        with st.expander("View notes"):
+                            st.markdown(goal["notes"])
+                with c2:
+                    if st.button("✅ Mark Reviewed", key=f"review_{goal['id']}", use_container_width=True):
                         advance_review(goal["id"])
                         st.rerun()
 
     st.divider()
     st.subheader("Upcoming Reviews")
     upcoming = get_upcoming_reviews()
-    if not upcoming:
-        st.caption("No upcoming reviews scheduled.")
-    else:
+    if upcoming:
         df = pd.DataFrame(upcoming)
-        df["stage_label"] = df["review_stage"].map(SRS_STAGE_LABELS)
-        df = df[["subject", "topic", "stage_label", "next_review_date"]]
+        df["Stage"] = df["review_stage"].map(SRS_STAGE_LABELS)
+        df = df[["subject", "topic", "Stage", "next_review_date"]]
         df.columns = ["Subject", "Topic", "Stage", "Due Date"]
         st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No upcoming reviews scheduled.")
 
 
-# --------------------------------------------------------------------------
-# UI: Analytics
-# --------------------------------------------------------------------------
+# =============================================================================
+# Analytics
+# =============================================================================
 
-def render_heatmap(daily_totals):
-    weeks_back = 18
+def render_heatmap(daily_totals, weeks=26):
     end = date.today()
-    start = end - timedelta(weeks=weeks_back)
-    start -= timedelta(days=start.weekday())  # align to Monday
+    start = end - timedelta(weeks=weeks - 1)
+    start -= timedelta(days=start.weekday())
+    end_display = start + timedelta(weeks=weeks) - timedelta(days=1)
 
-    num_days = (end - start).days + 1
-    num_weeks = (num_days // 7) + 1
+    z = [[0] * weeks for _ in range(7)]
+    x = [(start + timedelta(weeks=i)).strftime("%d %b") for i in range(weeks)]
 
-    z = [[0] * num_weeks for _ in range(7)]  # rows = weekday (Mon..Sun), cols = week index
-    week_labels = []
-    for w in range(num_weeks):
-        week_labels.append((start + timedelta(weeks=w)).strftime("%d %b"))
+    cursor = start
+    while cursor <= end_display:
+        wi = (cursor - start).days // 7
+        if 0 <= wi < weeks:
+            z[cursor.weekday()][wi] = daily_totals.get(cursor.isoformat(), 0)
+        cursor += timedelta(days=1)
 
-    d = start
-    while d <= end:
-        week_idx = (d - start).days // 7
-        weekday_idx = d.weekday()
-        minutes = daily_totals.get(d.isoformat(), 0)
-        if 0 <= week_idx < num_weeks:
-            z[weekday_idx][week_idx] = minutes
-        d += timedelta(days=1)
-
-    fig = go.Figure(
-        data=go.Heatmap(
-            z=z,
-            x=week_labels,
-            y=["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
-            colorscale="Greens",
-            hovertemplate="Week of %{x}<br>%{y}: %{z} min<extra></extra>",
-            showscale=True,
-        )
-    )
-    fig.update_layout(
-        height=280,
-        margin=dict(t=10, b=10, l=10, r=10),
-        xaxis=dict(showgrid=False, tickangle=-45),
-        yaxis=dict(showgrid=False, autorange="reversed"),
-    )
+    fig = go.Figure(go.Heatmap(
+        z=z,
+        x=x,
+        y=["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+        colorscale="Greens",
+        hovertemplate="Week of %{x}<br>%{y}: %{z} min<extra></extra>",
+    ))
+    fig.update_layout(height=300, margin=dict(t=10, b=10, l=10, r=10), xaxis=dict(tickangle=-45), yaxis=dict(autorange="reversed"))
     st.plotly_chart(fig, use_container_width=True)
 
 
 def render_time_distribution():
-    subject_totals = get_subject_totals()
-    col1, col2 = st.columns(2)
+    subjects = get_subject_totals()
+    c1, c2 = st.columns(2)
 
-    with col1:
+    with c1:
         st.markdown("**Study Time by Subject**")
-        if subject_totals:
-            df = pd.DataFrame(subject_totals)
+        if subjects:
+            df = pd.DataFrame(subjects)
             fig = px.pie(df, values="total", names="subject", hole=0.45)
-            fig.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=340)
+            fig.update_layout(height=340, margin=dict(t=10, b=10, l=10, r=10))
             st.plotly_chart(fig, use_container_width=True)
         else:
-            st.caption("No study sessions logged yet.")
+            st.caption("No study sessions yet.")
 
-    with col2:
-        st.markdown("**Study Time Trend**")
+    with c2:
+        st.markdown("**Daily / Weekly Trend**")
         view = st.radio("View", ["Daily (30d)", "Weekly (12w)"], horizontal=True, label_visibility="collapsed")
-        daily_totals = get_daily_totals(days_back=90)
-        if not daily_totals:
-            st.caption("No study sessions logged yet.")
+        daily = get_daily_totals(365)
+        if not daily:
+            st.caption("No study sessions yet.")
+            return
+
+        series = pd.Series(daily, dtype=float)
+        series.index = pd.to_datetime(series.index)
+        series = series.sort_index()
+
+        if view == "Daily (30d)":
+            start = pd.Timestamp(date.today() - timedelta(days=29))
+            index = pd.date_range(start, pd.Timestamp(date.today()))
+            plot = series.reindex(index, fill_value=0).reset_index()
+            plot.columns = ["date", "minutes"]
+            fig = px.bar(plot, x="date", y="minutes")
         else:
-            series = pd.Series(daily_totals)
-            series.index = pd.to_datetime(series.index)
-            series = series.sort_index()
+            weekly = series.resample("W-MON", label="left", closed="left").sum().tail(12)
+            plot = weekly.reset_index()
+            plot.columns = ["week_start", "minutes"]
+            fig = px.bar(plot, x="week_start", y="minutes")
 
-            if view == "Daily (30d)":
-                cutoff = pd.Timestamp(date.today() - timedelta(days=29))
-                plot_series = series[series.index >= cutoff]
-                full_range = pd.date_range(cutoff, pd.Timestamp(date.today()))
-                plot_series = plot_series.reindex(full_range, fill_value=0)
-                df_plot = plot_series.reset_index()
-                df_plot.columns = ["date", "minutes"]
-                fig = px.bar(df_plot, x="date", y="minutes")
-            else:
-                weekly = series.resample("W-MON", label="left", closed="left").sum()
-                weekly = weekly.tail(12)
-                df_plot = weekly.reset_index()
-                df_plot.columns = ["week_start", "minutes"]
-                fig = px.bar(df_plot, x="week_start", y="minutes")
-
-            fig.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=340)
-            st.plotly_chart(fig, use_container_width=True)
+        fig.update_layout(height=340, margin=dict(t=10, b=10, l=10, r=10))
+        st.plotly_chart(fig, use_container_width=True)
 
 
 def render_analytics():
     st.header("📈 Study Analytics")
-
-    daily_totals = get_daily_totals(days_back=365)
-    current_streak, longest_streak = compute_streaks(daily_totals)
+    daily = get_daily_totals(365)
+    current, longest = compute_streaks(daily)
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("🔥 Current Streak", f"{current_streak} day{'s' if current_streak != 1 else ''}")
-    c2.metric("🏆 Longest Streak", f"{longest_streak} day{'s' if longest_streak != 1 else ''}")
-    c3.metric("⏳ Overall Study Time", format_minutes(get_overall_total_minutes()))
+    c1.metric("🔥 Current Streak", f"{current} day{'s' if current != 1 else ''}")
+    c2.metric("🏆 Longest Streak", f"{longest} day{'s' if longest != 1 else ''}")
+    c3.metric("⏳ Grand Total", format_minutes(get_overall_total_minutes()))
 
-    st.subheader("Daily Study Activity")
-    if not daily_totals:
-        st.caption("No study sessions logged yet — the heatmap will fill in as you log focus sessions.")
+    st.subheader("Study Activity Heatmap")
+    if daily:
+        render_heatmap(daily)
     else:
-        render_heatmap(daily_totals)
+        st.caption("The heatmap will fill as you log study sessions.")
 
     st.divider()
-    st.subheader("Time Distribution")
+    st.subheader("Interactive Charts")
     render_time_distribution()
 
 
-# --------------------------------------------------------------------------
-# Main app
-# --------------------------------------------------------------------------
+# =============================================================================
+# Main
+# =============================================================================
 
 def main():
     st.set_page_config(page_title="Exam Study & Goal Tracker", page_icon="🎯", layout="wide")
     init_db()
     run_migrations()
 
+    st.session_state.setdefault("page", "Dashboard")
+    st.session_state.setdefault("edit_goal_id", None)
+
     st.sidebar.title("🎯 Study Tracker")
-    page = st.sidebar.radio(
-        "Navigate",
-        ["Dashboard", "Add Goal", "Resources", "Focus Timer", "Revision Queue", "Analytics"],
-        label_visibility="collapsed",
-    )
+    pages = ["Dashboard", "Add Goal", "Edit Goal", "Resources", "Focus Timer", "Revision Queue", "Analytics"]
+    page = st.sidebar.radio("Navigate", pages, key="page", label_visibility="collapsed")
 
     st.sidebar.divider()
     total_goals = len(get_goals(order_by_deadline=False))
-    pending_goals = len(get_goals(status="Pending", order_by_deadline=False))
-    due_reviews = len(get_revision_queue())
+    pending = len(get_goals(status="Pending", order_by_deadline=False))
     st.sidebar.caption(f"Total goals: {total_goals}")
-    st.sidebar.caption(f"Pending: {pending_goals}")
-    st.sidebar.caption(f"Reviews due: {due_reviews}")
+    st.sidebar.caption(f"Pending: {pending}")
+    st.sidebar.caption(f"Reviews due: {len(get_revision_queue())}")
     st.sidebar.caption(f"Focused today: {get_total_minutes_today()} min")
     st.sidebar.caption(f"Overall study time: {format_minutes(get_overall_total_minutes())}")
 
@@ -1159,6 +1212,8 @@ def main():
         render_dashboard()
     elif page == "Add Goal":
         render_add_goal()
+    elif page == "Edit Goal":
+        render_goal_editor_page()
     elif page == "Resources":
         render_resources()
     elif page == "Focus Timer":
