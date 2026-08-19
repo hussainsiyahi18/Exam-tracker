@@ -313,6 +313,10 @@ def add_study_log(subject, duration_minutes, topic=None, goal_id=None, log_dt=No
     }).execute()
 
 
+def delete_study_log(log_id):
+    get_supabase().table("study_logs").delete().eq("id", log_id).execute()
+
+
 def get_study_logs(limit=50):
     return _rows(
         get_supabase().table("study_logs").select("*")
@@ -957,11 +961,16 @@ def render_focus_timer():
 # =============================================================================
 
 def render_manual_study_log():
-    st.header("📝 Add Forgotten Study Session")
+    st.header("📝 Study Sessions")
     st.caption(
-        "Forgot to start the focus timer? Add the session manually with its "
-        "actual date, start time, duration, subject and topic."
+        "Add a forgotten session manually, or delete an incorrectly recorded "
+        "study session."
     )
+
+    # -------------------------------------------------------------------------
+    # Add manual session
+    # -------------------------------------------------------------------------
+    st.subheader("➕ Add Forgotten Study Session")
 
     goals = get_goals(order_by_deadline=False)
     subjects = get_distinct_subjects()
@@ -983,13 +992,21 @@ def render_manual_study_log():
             subject = st.text_input("Subject", key="manual_log_subject")
 
     with c2:
-        subject_goals = get_goals(subject=subject, order_by_deadline=False) if subject else []
+        subject_goals = (
+            get_goals(subject=subject, order_by_deadline=False)
+            if subject
+            else []
+        )
         goal_id = None
         topic = None
 
         if subject_goals:
-            options = {g["id"]: f"{g['topic']} ({g['status']})" for g in subject_goals}
+            options = {
+                g["id"]: f"{g['topic']} ({g['status']})"
+                for g in subject_goals
+            }
             options[None] = "Other / free-form topic"
+
             selected_goal = st.selectbox(
                 "Topic / Goal",
                 list(options),
@@ -998,14 +1015,22 @@ def render_manual_study_log():
             )
 
             if selected_goal is None:
-                topic = st.text_input("Topic", key="manual_log_topic")
+                topic = st.text_input(
+                    "Topic",
+                    key="manual_log_topic",
+                )
             else:
                 goal_id = selected_goal
                 topic = next(
-                    g["topic"] for g in subject_goals if g["id"] == selected_goal
+                    g["topic"]
+                    for g in subject_goals
+                    if g["id"] == selected_goal
                 )
         else:
-            topic = st.text_input("Topic", key="manual_log_topic")
+            topic = st.text_input(
+                "Topic",
+                key="manual_log_topic",
+            )
 
     c3, c4 = st.columns(2)
     with c3:
@@ -1040,37 +1065,90 @@ def render_manual_study_log():
     ):
         if not subject or not subject.strip():
             st.error("Please select or enter a subject.")
-            return
-        if not topic or not topic.strip():
+        elif not topic or not topic.strip():
             st.error("Please select or enter a topic.")
-            return
+        else:
+            log_datetime = datetime.combine(log_date, start_time)
 
-        log_datetime = datetime.combine(log_date, start_time)
+            try:
+                add_study_log(
+                    subject.strip(),
+                    int(duration),
+                    topic=topic.strip(),
+                    goal_id=goal_id,
+                    log_dt=log_datetime,
+                )
+                st.success(
+                    f"✅ Study session added successfully — "
+                    f"{format_minutes(duration)} of {subject.strip()} / "
+                    f"{topic.strip()} on {log_date:%d %b %Y} at "
+                    f"{start_time:%I:%M %p}."
+                )
+            except Exception as exc:
+                st.error(f"Could not add study session: {exc}")
 
-        try:
-            add_study_log(
-                subject.strip(),
-                int(duration),
-                topic=topic.strip(),
-                goal_id=goal_id,
-                log_dt=log_datetime,
-            )
-            st.success(
-                f"Added {format_minutes(duration)} of study time for "
-                f"{subject.strip()} — {topic.strip()} on "
-                f"{log_date:%d %b %Y} at {start_time:%I:%M %p}."
-            )
-            st.rerun()
-        except Exception as exc:
-            st.error(f"Could not add study session: {exc}")
-
+    # -------------------------------------------------------------------------
+    # Delete study session
+    # -------------------------------------------------------------------------
     st.divider()
-    st.subheader("What gets recorded?")
+    st.subheader("🗑️ Delete Study Session")
     st.caption(
-        "The session is added to the same study_logs table as Focus Timer "
-        "sessions, so it contributes to topic totals, subject totals, "
-        "heatmaps, streaks and analytics."
+        "Use this if you accidentally logged a session or entered the wrong "
+        "duration. Deleting it also removes it from your analytics and streaks."
     )
+
+    logs = get_study_logs(limit=100)
+
+    if not logs:
+        st.info("No study sessions have been recorded yet.")
+        return
+
+    for log in logs:
+        try:
+            logged_at = datetime.fromisoformat(log["log_date"])
+            date_text = logged_at.strftime("%d %b %Y")
+            time_text = logged_at.strftime("%I:%M %p")
+        except (TypeError, ValueError):
+            date_text = str(log.get("log_date", "Unknown date"))
+            time_text = ""
+
+        subject_text = log.get("subject") or "Unknown Subject"
+        topic_text = log.get("topic") or "No topic"
+        duration_text = format_minutes(log.get("duration_minutes", 0))
+
+        with st.container(border=True):
+            c1, c2 = st.columns([5, 1])
+
+            with c1:
+                st.markdown(
+                    f"**{subject_text} → {topic_text}**  \n"
+                    f"📅 {date_text} · 🕐 {time_text} · "
+                    f"⏱️ **{duration_text}**"
+                )
+
+            with c2:
+                if st.button(
+                    "🗑️ Delete",
+                    key=f"delete_study_log_{log['id']}",
+                    use_container_width=True,
+                ):
+                    try:
+                        delete_study_log(log["id"])
+                        st.session_state["study_log_deleted_message"] = (
+                            f"🗑️ Deleted {duration_text} study session for "
+                            f"{subject_text} → {topic_text}."
+                        )
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"Could not delete study session: {exc}")
+
+    # Show delete confirmation after rerun.
+    deleted_message = st.session_state.pop(
+        "study_log_deleted_message",
+        None,
+    )
+    if deleted_message:
+        st.success(deleted_message)
 
 
 # =============================================================================
