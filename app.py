@@ -1,29 +1,34 @@
-from pathlib import Path
-import re
+"""Exam Study & Goal Tracker
 
-src_path = Path("/mnt/data/Pasted text(20260819-110946).txt")
-src = src_path.read_text(encoding="utf-8")
+Single-file Streamlit + Supabase application with:
+- Full goal CRUD, including editing and deletion
+- Markdown notes per goal
+- Spaced repetition (+1, +3, +7 days)
+- Topic-level focus timer and study logging
+- Study analytics, heatmap and streaks
+- .ics calendar export for exam/revision milestones
 
-# Imports/config: remove local SQLite/filesystem dependencies, add Supabase.
-src = src.replace("Single-file Streamlit + SQLite application with:", "Single-file Streamlit + Supabase application with:")
-src = src.replace(
-    "pip install streamlit pandas plotly icalendar",
-    "pip install streamlit pandas plotly icalendar supabase"
-)
-src = src.replace(
-    "import os\nimport sqlite3\nimport subprocess\nimport sys\nimport time\nimport uuid\nfrom contextlib import contextmanager\n",
-    "import mimetypes\nimport time\nimport uuid\n"
-)
-src = src.replace(
-    "from icalendar import Calendar, Event\n",
-    "from icalendar import Calendar, Event\nfrom supabase import create_client, Client\n"
-)
+Install:
+    pip install streamlit pandas plotly icalendar supabase
 
-config_start = src.index("# =============================================================================\n# Configuration")
-db_start = src.index("# =============================================================================\n# Database")
-goal_crud_start = src.index("# =============================================================================\n# Goal CRUD")
+Run:
+    streamlit run exam_tracker_updated.py
+"""
 
-new_config_db = '''# =============================================================================
+import mimetypes
+import time
+import uuid
+from datetime import date, datetime, time as dtime, timedelta
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+from icalendar import Calendar, Event
+from supabase import create_client, Client
+
+
+# =============================================================================
 # Configuration
 # =============================================================================
 
@@ -83,15 +88,7 @@ def _rows(response):
     return response.data or []
 
 
-'''
-
-src = src[:config_start] + new_config_db + src[goal_crud_start:]
-
-# Replace Goal CRUD + SRS + Resources + study log DB helpers in one large block.
-goal_start = src.index("# =============================================================================\n# Goal CRUD")
-formatting_start = src.index("# =============================================================================\n# Formatting / calendar export")
-
-new_data_layer = r'''# =============================================================================
+# =============================================================================
 # Goal CRUD
 # =============================================================================
 
@@ -416,15 +413,321 @@ def compute_streaks(daily_totals):
     return current, longest
 
 
-'''
+# =============================================================================
+# Formatting / calendar export
+# =============================================================================
 
-src = src[:goal_start] + new_data_layer + src[formatting_start:]
+def parse_deadline(value):
+    return datetime.fromisoformat(value)
 
-# Replace Resources UI only.
-resources_ui_start = src.index("# =============================================================================\n# Resources\n# =============================================================================", src.index("# Add Goal"))
-focus_start = src.index("# =============================================================================\n# Focus Timer", resources_ui_start)
 
-new_resources_ui = r'''# =============================================================================
+def urgency_bucket(deadline_dt, now=None):
+    now = now or datetime.now()
+    delta = deadline_dt - now
+    if delta.total_seconds() < 0:
+        return "overdue", delta
+    if delta.total_seconds() < 48 * 3600:
+        return "urgent", delta
+    return "upcoming", delta
+
+
+def format_countdown(delta):
+    seconds = int(delta.total_seconds())
+    sign = "-" if seconds < 0 else ""
+    seconds = abs(seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours or days:
+        parts.append(f"{hours}h")
+    parts.append(f"{minutes}m")
+    return sign + " ".join(parts)
+
+
+URGENCY_STYLE = {
+    "overdue": ("#d9363e", "OVERDUE"),
+    "urgent": ("#e08a1e", "URGENT"),
+    "upcoming": ("#2f9e44", "UPCOMING"),
+}
+
+
+def urgency_badge_html(bucket):
+    bg, label = URGENCY_STYLE[bucket]
+    return f'<span style="background:{bg};color:#fff;padding:2px 10px;border-radius:12px;font-size:.75rem;font-weight:600">{label}</span>'
+
+
+def priority_badge_html(priority):
+    color = {"High": "#d9363e", "Medium": "#e08a1e", "Low": "#2f6fb0"}.get(priority, "#666")
+    return f'<span style="border:1px solid {color};color:{color};padding:1px 8px;border-radius:10px;font-size:.72rem;font-weight:600">{priority}</span>'
+
+
+def review_badge_html(stage_label, overdue=False):
+    bg = "#d9363e" if overdue else "#7048e8"
+    return f'<span style="background:{bg};color:#fff;padding:1px 8px;border-radius:10px;font-size:.72rem;font-weight:600">🔁 {stage_label}</span>'
+
+
+def generate_ics_bytes():
+    """Export exam deadlines plus completion/revision milestone dates."""
+    cal = Calendar()
+    cal.add("prodid", "-//Exam Study and Goal Tracker//")
+    cal.add("version", "2.0")
+
+    for goal in get_goals(order_by_deadline=False):
+        deadline = parse_deadline(goal["deadline"])
+        event = Event()
+        event.add("summary", f"EXAM: {goal['subject']} — {goal['topic']} ({goal['exam_type']})")
+        event.add("dtstart", deadline)
+        event.add("dtend", deadline + timedelta(hours=1))
+        event.add("dtstamp", datetime.now())
+        event.add("description", f"Priority: {goal['priority']} | Status: {goal['status']}")
+        event.add("uid", f"goal-{goal['id']}@exam-study-tracker")
+        cal.add_component(event)
+
+        if goal.get("completed_at"):
+            completed = datetime.fromisoformat(goal["completed_at"])
+            milestone = Event()
+            milestone.add("summary", f"MILESTONE: Completed — {goal['subject']} / {goal['topic']}")
+            milestone.add("dtstart", completed)
+            milestone.add("dtend", completed + timedelta(minutes=15))
+            milestone.add("dtstamp", datetime.now())
+            milestone.add("uid", f"completed-{goal['id']}@exam-study-tracker")
+            cal.add_component(milestone)
+
+        stage = goal.get("review_stage") or 0
+        if 1 <= stage <= 3 and goal.get("next_review_date"):
+            review = Event()
+            review.add("summary", f"REVIEW: {goal['subject']} — {goal['topic']} ({SRS_STAGE_LABELS[stage]})")
+            review.add("dtstart", date.fromisoformat(goal["next_review_date"]))
+            review.add("dtstamp", datetime.now())
+            review.add("description", "Spaced-repetition revision milestone")
+            review.add("uid", f"review-{goal['id']}-{stage}@exam-study-tracker")
+            cal.add_component(review)
+
+    return cal.to_ical()
+
+
+# =============================================================================
+# Goal notes / editing UI
+# =============================================================================
+
+def render_goal_notes(goal):
+    with st.expander("📝 Notes / formulas / doubts", expanded=False):
+        notes_key = f"notes_{goal['id']}"
+        if notes_key not in st.session_state:
+            st.session_state[notes_key] = goal.get("notes") or ""
+        edited = st.text_area(
+            "Markdown editor",
+            key=notes_key,
+            height=180,
+            placeholder="## Key formulas\n- Formula 1\n\n## Doubts\n- Clarify...",
+            label_visibility="collapsed",
+        )
+        if st.button("💾 Save Notes", key=f"save_notes_{goal['id']}"):
+            save_goal_notes(goal["id"], edited)
+            st.success("Notes saved.")
+        if edited.strip():
+            st.markdown("**Preview**")
+            st.markdown(edited)
+        else:
+            st.caption("No notes saved for this goal yet.")
+
+
+def render_edit_goal(goal_id):
+    st.header("✏️ Edit Goal")
+    goal = get_goal_by_id(goal_id)
+    if not goal:
+        st.error("That goal no longer exists.")
+        return
+
+    deadline_dt = parse_deadline(goal["deadline"])
+    st.caption(f"Editing #{goal['id']} — {goal['subject']} / {goal['topic']}")
+
+    with st.form(f"edit_goal_form_{goal_id}"):
+        c1, c2 = st.columns(2)
+        with c1:
+            subject = st.text_input("Subject", value=goal["subject"])
+            topic = st.text_input("Topic", value=goal["topic"])
+            exam_type = st.selectbox("Exam Type", EXAM_TYPES, index=EXAM_TYPES.index(goal["exam_type"]) if goal["exam_type"] in EXAM_TYPES else 0)
+            deadline_date = st.date_input("Deadline Date", value=deadline_dt.date())
+        with c2:
+            priority = st.selectbox("Priority", PRIORITIES, index=PRIORITIES.index(goal["priority"]) if goal["priority"] in PRIORITIES else 1)
+            status = st.selectbox("Status", STATUSES, index=STATUSES.index(goal["status"]) if goal["status"] in STATUSES else 0)
+            deadline_time = st.time_input("Deadline Time", value=deadline_dt.time())
+            notes = st.text_area("Notes (Markdown)", value=goal.get("notes") or "", height=180)
+
+        save = st.form_submit_button("💾 Save Changes", type="primary", use_container_width=True)
+
+    if save:
+        if not subject.strip() or not topic.strip():
+            st.error("Subject and Topic are required.")
+        else:
+            update_goal(
+                goal_id, subject, topic,
+                datetime.combine(deadline_date, deadline_time),
+                priority, status, exam_type, notes,
+            )
+            st.success("Goal updated successfully.")
+            st.session_state.edit_goal_id = goal_id
+            st.rerun()
+
+    st.divider()
+    st.subheader("Danger Zone")
+    confirm = st.checkbox("I understand that deleting this goal cannot be undone.", key=f"confirm_delete_{goal_id}")
+    if st.button("🗑️ Delete Goal", disabled=not confirm, key=f"delete_edit_{goal_id}"):
+        delete_goal(goal_id)
+        st.session_state.edit_goal_id = None
+        st.success("Goal deleted.")
+        st.rerun()
+
+
+def render_goal_editor_page():
+    goals = get_goals(order_by_deadline=False)
+    if not goals:
+        st.header("✏️ Edit Goal")
+        st.info("No goals exist yet. Add a goal first.")
+        return
+
+    labels = {g["id"]: f"#{g['id']} — {g['subject']} / {g['topic']}" for g in goals}
+    current = st.session_state.get("edit_goal_id")
+    ids = list(labels)
+    default_index = ids.index(current) if current in ids else 0
+    selected = st.selectbox("Select a goal to edit", ids, index=default_index, format_func=lambda x: labels[x])
+    st.session_state.edit_goal_id = selected
+    render_edit_goal(selected)
+
+
+# =============================================================================
+# Dashboard
+# =============================================================================
+
+def render_dashboard():
+    st.header("📊 Dashboard")
+
+    c1, c2, c3, c4 = st.columns(4)
+    all_goals = get_goals(order_by_deadline=False)
+    pending = [g for g in all_goals if g["status"] == "Pending"]
+    c1.metric("Total Goals", len(all_goals))
+    c2.metric("Pending", len(pending))
+    c3.metric("Reviews Due", len(get_revision_queue()))
+    c4.metric("Study Today", format_minutes(get_total_minutes_today()))
+
+    st.download_button(
+        "📅 Export Deadlines & Milestones (.ics)",
+        data=generate_ics_bytes(),
+        file_name="study_tracker_export.ics",
+        mime="text/calendar",
+        use_container_width=True,
+    )
+
+    subjects = ["All"] + get_distinct_subjects()
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        subject_filter = st.selectbox("Filter by Subject", subjects, key="dash_subject")
+    with f2:
+        exam_filter = st.selectbox("Filter by Exam Type", ["All"] + EXAM_TYPES, key="dash_exam")
+    with f3:
+        status_filter = st.selectbox("Status", ["All", "Pending", "Completed"], index=1, key="dash_status")
+
+    goals = get_goals(subject_filter, exam_filter, status_filter)
+    st.subheader("Goals")
+
+    if not goals:
+        st.info("No goals match the current filters. Add a goal from the sidebar.")
+    else:
+        now = datetime.now()
+        today = date.today()
+        for goal in goals:
+            deadline = parse_deadline(goal["deadline"])
+            bucket, delta = urgency_bucket(deadline, now)
+            completed = goal["status"] == "Completed"
+
+            with st.container(border=True):
+                top, actions = st.columns([4, 1])
+                with top:
+                    st.markdown(f"### {goal['subject']} — {goal['topic']}")
+                    badges = priority_badge_html(goal["priority"])
+                    badges += f'&nbsp;&nbsp;<span style="background:#444;color:#fff;padding:1px 8px;border-radius:10px;font-size:.72rem">{goal["exam_type"]}</span>'
+                    if not completed:
+                        badges += "&nbsp;&nbsp;" + urgency_badge_html(bucket)
+                    else:
+                        badges += '&nbsp;&nbsp;<span style="background:#2f6fb0;color:#fff;padding:1px 8px;border-radius:10px;font-size:.72rem">COMPLETED</span>'
+                    st.markdown(badges, unsafe_allow_html=True)
+                    st.caption(f"Deadline: {deadline.strftime('%a, %d %b %Y %I:%M %p')}")
+
+                    if not completed:
+                        if bucket == "overdue":
+                            st.markdown(f"**Overdue by:** `{format_countdown(delta).lstrip('-')}`")
+                        else:
+                            st.markdown(f"**Time remaining:** `{format_countdown(delta)}`")
+                    elif goal.get("next_review_date") and 1 <= (goal.get("review_stage") or 0) <= 3:
+                        review_date = date.fromisoformat(goal["next_review_date"])
+                        overdue = review_date <= today
+                        st.markdown(review_badge_html(SRS_STAGE_LABELS[goal["review_stage"]], overdue), unsafe_allow_html=True)
+                        st.caption(f"Next revision due: {review_date.strftime('%a, %d %b %Y')}")
+
+                    render_goal_notes(goal)
+
+                with actions:
+                    if st.button("✏️ Edit", key=f"edit_{goal['id']}", use_container_width=True):
+                        st.session_state.edit_goal_id = goal["id"]
+                        st.session_state.page = "Edit Goal"
+                        st.rerun()
+                    if not completed:
+                        if st.button("✅ Complete", key=f"complete_{goal['id']}", use_container_width=True):
+                            mark_goal_completed(goal["id"])
+                            st.rerun()
+                    else:
+                        if st.button("↩️ Reopen", key=f"reopen_{goal['id']}", use_container_width=True):
+                            reopen_goal(goal["id"])
+                            st.rerun()
+                    if st.button("🗑️ Delete", key=f"delete_{goal['id']}", use_container_width=True):
+                        delete_goal(goal["id"])
+                        st.rerun()
+
+    st.divider()
+    st.subheader("📈 Syllabus Completion by Subject")
+    if not all_goals:
+        st.caption("No goals yet.")
+    else:
+        df = pd.DataFrame(all_goals)
+        summary = df.groupby("subject")["status"].apply(lambda s: (s == "Completed").mean()).reset_index(name="pct")
+        for _, row in summary.iterrows():
+            st.write(f"**{row['subject']}** — {row['pct'] * 100:.0f}% complete")
+            st.progress(float(row["pct"]))
+
+
+# =============================================================================
+# Add Goal
+# =============================================================================
+
+def render_add_goal():
+    st.header("➕ Add a New Goal")
+    with st.form("add_goal_form", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+        with c1:
+            subject = st.text_input("Subject", placeholder="e.g. Data Structures")
+            topic = st.text_input("Topic", placeholder="e.g. Binary Search Trees")
+            exam_type = st.selectbox("Exam Type", EXAM_TYPES)
+            deadline_date = st.date_input("Deadline Date", value=date.today() + timedelta(days=7))
+        with c2:
+            priority = st.selectbox("Priority", PRIORITIES)
+            deadline_time = st.time_input("Deadline Time", value=dtime(23, 59))
+            notes = st.text_area("Notes / formulas / doubts (Markdown)", height=180)
+
+        submitted = st.form_submit_button("Add Goal", type="primary", use_container_width=True)
+
+    if submitted:
+        if not subject.strip() or not topic.strip():
+            st.error("Subject and Topic are required.")
+        else:
+            add_goal(subject, topic, datetime.combine(deadline_date, deadline_time), priority, exam_type, notes)
+            st.success(f"Goal '{topic}' added for {subject}.")
+
+
+# =============================================================================
 # Resources
 # =============================================================================
 
@@ -493,89 +796,333 @@ def render_resources():
                     st.rerun()
 
 
-'''
+# =============================================================================
+# Focus Timer
+# =============================================================================
 
-src = src[:resources_ui_start] + new_resources_ui + src[focus_start:]
+def init_timer_state():
+    defaults = {
+        "timer_running": False,
+        "timer_end": None,
+        "timer_start": None,
+        "timer_subject": "",
+        "timer_topic": None,
+        "timer_goal_id": None,
+        "timer_duration_min": 25,
+    }
+    for key, value in defaults.items():
+        st.session_state.setdefault(key, value)
 
-# Update stale UI wording.
-src = src.replace(
-    'st.caption("Select a subject and specific topic before starting. Every completed session is stored in SQLite.")',
-    'st.caption("Select a subject and specific topic before starting. Every completed session is stored persistently in Supabase.")'
-)
 
-# Main init remains valid (init_db now validates Supabase).
-out = Path("/mnt/data/app.py")
-out.write_text(src, encoding="utf-8")
+def render_time_stats(subject, topic, goal_id):
+    topic_total = get_topic_total_minutes(subject, topic, goal_id) if topic else 0
+    subject_total = get_subject_total_minutes(subject) if subject else 0
+    overall = get_overall_total_minutes()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Topic Total", format_minutes(topic_total))
+    c2.metric("Subject Total", format_minutes(subject_total))
+    c3.metric("Grand Total", format_minutes(overall))
 
-# SQL setup: idempotent schema + private storage bucket.
-sql = r'''-- Run this ONCE in Supabase Dashboard → SQL Editor.
--- It is safe to run again.
 
-create table if not exists public.goals (
-    id bigint generated by default as identity primary key,
-    subject text not null,
-    topic text not null,
-    deadline text not null,
-    priority text not null,
-    status text not null default 'Pending',
-    exam_type text not null,
-    notes text default '',
-    completed_at text,
-    next_review_date text,
-    review_stage integer not null default 0
-);
+def clear_timer_state():
+    st.session_state.timer_running = False
+    st.session_state.timer_end = None
+    st.session_state.timer_start = None
+    st.session_state.timer_subject = ""
+    st.session_state.timer_topic = None
+    st.session_state.timer_goal_id = None
 
-create table if not exists public.study_logs (
-    id bigint generated by default as identity primary key,
-    subject text not null,
-    duration_minutes integer not null,
-    log_date text not null,
-    topic text,
-    goal_id bigint references public.goals(id) on delete set null
-);
 
-create table if not exists public.resources (
-    id bigint generated by default as identity primary key,
-    goal_id bigint references public.goals(id) on delete cascade,
-    file_name text not null,
-    storage_path text not null,
-    file_type text not null
-);
+def render_focus_timer():
+    st.header("⏱️ Focus Timer")
+    st.caption("Select a subject and specific topic before starting. Every completed session is stored persistently in Supabase.")
+    init_timer_state()
 
--- Backward-compatible additions if you already created an earlier Supabase schema.
-alter table public.goals add column if not exists notes text default '';
-alter table public.goals add column if not exists completed_at text;
-alter table public.goals add column if not exists next_review_date text;
-alter table public.goals add column if not exists review_stage integer not null default 0;
-alter table public.study_logs add column if not exists topic text;
-alter table public.study_logs add column if not exists goal_id bigint references public.goals(id) on delete set null;
-alter table public.resources add column if not exists storage_path text;
+    if not st.session_state.timer_running:
+        subjects = get_distinct_subjects()
+        c1, c2 = st.columns(2)
 
--- This app uses a server-side Supabase secret key stored in Streamlit Secrets.
--- RLS stays enabled; the secret/service role bypasses it.
-alter table public.goals enable row level security;
-alter table public.study_logs enable row level security;
-alter table public.resources enable row level security;
+        with c1:
+            if subjects:
+                subject_choice = st.selectbox("Subject", subjects + ["Other (type below)"], key="timer_subject_choice")
+                if subject_choice == "Other (type below)":
+                    subject = st.text_input("Enter subject", key="timer_subject_manual")
+                else:
+                    subject = subject_choice
+            else:
+                subject = st.text_input("Subject", key="timer_subject_manual")
 
--- Private bucket for PDFs/PPTs/images.
-insert into storage.buckets (id, name, public)
-values ('study-resources', 'study-resources', false)
-on conflict (id) do update set public = false;
-'''
-Path("/mnt/data/supabase_setup.sql").write_text(sql, encoding="utf-8")
+        with c2:
+            subject_goals = get_goals(subject=subject, order_by_deadline=False) if subject else []
+            goal_id = None
+            topic = None
+            if subject_goals:
+                options = {g["id"]: f"{g['topic']} ({g['status']})" for g in subject_goals}
+                options[None] = "General / no specific goal"
+                selected = st.selectbox("Topic / Goal", list(options), format_func=lambda x: options[x], key="timer_goal_choice")
+                if selected is None:
+                    topic = st.text_input("Free-form topic", key="timer_topic_manual")
+                else:
+                    goal_id = selected
+                    topic = next(g["topic"] for g in subject_goals if g["id"] == selected)
+            else:
+                topic = st.text_input("Topic", key="timer_topic_manual")
 
-requirements = """streamlit
-pandas
-plotly
-icalendar
-supabase
-"""
-Path("/mnt/data/requirements.txt").write_text(requirements, encoding="utf-8")
+        if subject:
+            st.caption("Current totals")
+            render_time_stats(subject, topic, goal_id)
 
-# Syntax check
-compile(src, str(out), "exec")
+        duration_choice = st.selectbox("Session length", [15, 25, 45, 60, "Custom"])
+        duration = st.number_input("Custom minutes", 1, 240, 25) if duration_choice == "Custom" else duration_choice
 
-print("Created:")
-print("/mnt/data/app.py")
-print("/mnt/data/supabase_setup.sql")
-print("/mnt/data/requirements.txt")
+        if st.button("▶️ Start Focus Session", type="primary", use_container_width=True):
+            if not subject or not subject.strip():
+                st.error("Please select or enter a subject.")
+            elif not topic or not topic.strip():
+                st.error("Please select or enter a topic. Topic-level tracking requires a topic.")
+            else:
+                st.session_state.timer_subject = subject.strip()
+                st.session_state.timer_topic = topic.strip()
+                st.session_state.timer_goal_id = goal_id
+                st.session_state.timer_duration_min = int(duration)
+                st.session_state.timer_start = datetime.now()
+                st.session_state.timer_end = datetime.now() + timedelta(minutes=int(duration))
+                st.session_state.timer_running = True
+                st.rerun()
+
+    else:
+        remaining = st.session_state.timer_end - datetime.now()
+        seconds = int(remaining.total_seconds())
+        topic_label = st.session_state.timer_topic
+        st.markdown(f"### Studying: {st.session_state.timer_subject} — {topic_label}")
+
+        if seconds <= 0:
+            add_study_log(
+                st.session_state.timer_subject,
+                st.session_state.timer_duration_min,
+                topic=topic_label,
+                goal_id=st.session_state.timer_goal_id,
+            )
+            st.success(f"Session complete! Logged {st.session_state.timer_duration_min} minutes.")
+            st.balloons()
+            clear_timer_state()
+        else:
+            mins, secs = divmod(seconds, 60)
+            st.markdown(f'<div style="text-align:center;font-size:3.5rem;font-weight:700">{mins:02d}:{secs:02d}</div>', unsafe_allow_html=True)
+            total_seconds = st.session_state.timer_duration_min * 60
+            st.progress(min(max(1 - seconds / total_seconds, 0), 1))
+
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("⏹️ Stop & Log Elapsed Time", use_container_width=True):
+                    elapsed = max(1, int((datetime.now() - st.session_state.timer_start).total_seconds() // 60))
+                    add_study_log(st.session_state.timer_subject, elapsed, topic=topic_label, goal_id=st.session_state.timer_goal_id)
+                    st.success(f"Logged {elapsed} minutes.")
+                    clear_timer_state()
+                    st.rerun()
+            with c2:
+                if st.button("❌ Cancel (No Log)", use_container_width=True):
+                    clear_timer_state()
+                    st.rerun()
+
+            time.sleep(1)
+            st.rerun()
+
+    st.divider()
+    c1, c2 = st.columns(2)
+    c1.metric("Focused Today", format_minutes(get_total_minutes_today()))
+    c2.metric("Grand Total", format_minutes(get_overall_total_minutes()))
+
+    st.subheader("Recent Sessions")
+    logs = get_study_logs(20)
+    if logs:
+        df = pd.DataFrame(logs)[["subject", "topic", "duration_minutes", "log_date"]]
+        df.columns = ["Subject", "Topic", "Minutes", "Logged At"]
+        df["Topic"] = df["Topic"].fillna("General")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No sessions logged yet.")
+
+
+# =============================================================================
+# Revision Queue
+# =============================================================================
+
+def render_revision_queue():
+    st.header("🔁 Revision Queue")
+    st.caption("Completed goals are scheduled automatically for +1, +3 and +7 day reviews.")
+
+    due = get_revision_queue()
+    today = date.today()
+    st.subheader("Due Today / Overdue")
+    if not due:
+        st.success("Nothing due right now. 🎉")
+    else:
+        for goal in due:
+            review_date = date.fromisoformat(goal["next_review_date"])
+            overdue = review_date < today
+            stage = goal["review_stage"]
+            with st.container(border=True):
+                c1, c2 = st.columns([4, 1])
+                with c1:
+                    st.markdown(f"**{goal['subject']} — {goal['topic']}**")
+                    st.markdown(review_badge_html(SRS_STAGE_LABELS[stage], overdue), unsafe_allow_html=True)
+                    st.caption((f"Was due {review_date:%a, %d %b %Y} (overdue)" if overdue else f"Due today: {review_date:%a, %d %b %Y}"))
+                    if goal.get("notes"):
+                        with st.expander("View notes"):
+                            st.markdown(goal["notes"])
+                with c2:
+                    if st.button("✅ Mark Reviewed", key=f"review_{goal['id']}", use_container_width=True):
+                        advance_review(goal["id"])
+                        st.rerun()
+
+    st.divider()
+    st.subheader("Upcoming Reviews")
+    upcoming = get_upcoming_reviews()
+    if upcoming:
+        df = pd.DataFrame(upcoming)
+        df["Stage"] = df["review_stage"].map(SRS_STAGE_LABELS)
+        df = df[["subject", "topic", "Stage", "next_review_date"]]
+        df.columns = ["Subject", "Topic", "Stage", "Due Date"]
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No upcoming reviews scheduled.")
+
+
+# =============================================================================
+# Analytics
+# =============================================================================
+
+def render_heatmap(daily_totals, weeks=26):
+    end = date.today()
+    start = end - timedelta(weeks=weeks - 1)
+    start -= timedelta(days=start.weekday())
+    end_display = start + timedelta(weeks=weeks) - timedelta(days=1)
+
+    z = [[0] * weeks for _ in range(7)]
+    x = [(start + timedelta(weeks=i)).strftime("%d %b") for i in range(weeks)]
+
+    cursor = start
+    while cursor <= end_display:
+        wi = (cursor - start).days // 7
+        if 0 <= wi < weeks:
+            z[cursor.weekday()][wi] = daily_totals.get(cursor.isoformat(), 0)
+        cursor += timedelta(days=1)
+
+    fig = go.Figure(go.Heatmap(
+        z=z,
+        x=x,
+        y=["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+        colorscale="Greens",
+        hovertemplate="Week of %{x}<br>%{y}: %{z} min<extra></extra>",
+    ))
+    fig.update_layout(height=300, margin=dict(t=10, b=10, l=10, r=10), xaxis=dict(tickangle=-45), yaxis=dict(autorange="reversed"))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_time_distribution():
+    subjects = get_subject_totals()
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.markdown("**Study Time by Subject**")
+        if subjects:
+            df = pd.DataFrame(subjects)
+            fig = px.pie(df, values="total", names="subject", hole=0.45)
+            fig.update_layout(height=340, margin=dict(t=10, b=10, l=10, r=10))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.caption("No study sessions yet.")
+
+    with c2:
+        st.markdown("**Daily / Weekly Trend**")
+        view = st.radio("View", ["Daily (30d)", "Weekly (12w)"], horizontal=True, label_visibility="collapsed")
+        daily = get_daily_totals(365)
+        if not daily:
+            st.caption("No study sessions yet.")
+            return
+
+        series = pd.Series(daily, dtype=float)
+        series.index = pd.to_datetime(series.index)
+        series = series.sort_index()
+
+        if view == "Daily (30d)":
+            start = pd.Timestamp(date.today() - timedelta(days=29))
+            index = pd.date_range(start, pd.Timestamp(date.today()))
+            plot = series.reindex(index, fill_value=0).reset_index()
+            plot.columns = ["date", "minutes"]
+            fig = px.bar(plot, x="date", y="minutes")
+        else:
+            weekly = series.resample("W-MON", label="left", closed="left").sum().tail(12)
+            plot = weekly.reset_index()
+            plot.columns = ["week_start", "minutes"]
+            fig = px.bar(plot, x="week_start", y="minutes")
+
+        fig.update_layout(height=340, margin=dict(t=10, b=10, l=10, r=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def render_analytics():
+    st.header("📈 Study Analytics")
+    daily = get_daily_totals(365)
+    current, longest = compute_streaks(daily)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("🔥 Current Streak", f"{current} day{'s' if current != 1 else ''}")
+    c2.metric("🏆 Longest Streak", f"{longest} day{'s' if longest != 1 else ''}")
+    c3.metric("⏳ Grand Total", format_minutes(get_overall_total_minutes()))
+
+    st.subheader("Study Activity Heatmap")
+    if daily:
+        render_heatmap(daily)
+    else:
+        st.caption("The heatmap will fill as you log study sessions.")
+
+    st.divider()
+    st.subheader("Interactive Charts")
+    render_time_distribution()
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+def main():
+    st.set_page_config(page_title="Exam Study & Goal Tracker", page_icon="🎯", layout="wide")
+    init_db()
+    run_migrations()
+
+    st.session_state.setdefault("page", "Dashboard")
+    st.session_state.setdefault("edit_goal_id", None)
+
+    st.sidebar.title("🎯 Study Tracker")
+    pages = ["Dashboard", "Add Goal", "Edit Goal", "Resources", "Focus Timer", "Revision Queue", "Analytics"]
+    page = st.sidebar.radio("Navigate", pages, key="page", label_visibility="collapsed")
+
+    st.sidebar.divider()
+    total_goals = len(get_goals(order_by_deadline=False))
+    pending = len(get_goals(status="Pending", order_by_deadline=False))
+    st.sidebar.caption(f"Total goals: {total_goals}")
+    st.sidebar.caption(f"Pending: {pending}")
+    st.sidebar.caption(f"Reviews due: {len(get_revision_queue())}")
+    st.sidebar.caption(f"Focused today: {get_total_minutes_today()} min")
+    st.sidebar.caption(f"Overall study time: {format_minutes(get_overall_total_minutes())}")
+
+    if page == "Dashboard":
+        render_dashboard()
+    elif page == "Add Goal":
+        render_add_goal()
+    elif page == "Edit Goal":
+        render_goal_editor_page()
+    elif page == "Resources":
+        render_resources()
+    elif page == "Focus Timer":
+        render_focus_timer()
+    elif page == "Revision Queue":
+        render_revision_queue()
+    elif page == "Analytics":
+        render_analytics()
+
+
+if __name__ == "__main__":
+    main()
