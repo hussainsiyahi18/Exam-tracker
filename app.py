@@ -929,6 +929,14 @@ def render_focus_timer():
             st.rerun()
 
     st.divider()
+    if st.button(
+        "📝 Forgot to start the timer? Add a session manually",
+        use_container_width=True,
+    ):
+        st.session_state.pending_page = "Manual Study Log"
+        st.rerun()
+
+    st.divider()
     c1, c2 = st.columns(2)
     c1.metric("Focused Today", format_minutes(get_total_minutes_today()))
     c2.metric("Grand Total", format_minutes(get_overall_total_minutes()))
@@ -942,6 +950,127 @@ def render_focus_timer():
         st.dataframe(df, use_container_width=True, hide_index=True)
     else:
         st.caption("No sessions logged yet.")
+
+
+# =============================================================================
+# Manual Study Log
+# =============================================================================
+
+def render_manual_study_log():
+    st.header("📝 Add Forgotten Study Session")
+    st.caption(
+        "Forgot to start the focus timer? Add the session manually with its "
+        "actual date, start time, duration, subject and topic."
+    )
+
+    goals = get_goals(order_by_deadline=False)
+    subjects = get_distinct_subjects()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if subjects:
+            subject = st.selectbox(
+                "Subject",
+                subjects + ["Other (type below)"],
+                key="manual_log_subject_choice",
+            )
+            if subject == "Other (type below)":
+                subject = st.text_input(
+                    "Enter subject",
+                    key="manual_log_subject",
+                )
+        else:
+            subject = st.text_input("Subject", key="manual_log_subject")
+
+    with c2:
+        subject_goals = get_goals(subject=subject, order_by_deadline=False) if subject else []
+        goal_id = None
+        topic = None
+
+        if subject_goals:
+            options = {g["id"]: f"{g['topic']} ({g['status']})" for g in subject_goals}
+            options[None] = "Other / free-form topic"
+            selected_goal = st.selectbox(
+                "Topic / Goal",
+                list(options),
+                format_func=lambda x: options[x],
+                key="manual_log_goal",
+            )
+
+            if selected_goal is None:
+                topic = st.text_input("Topic", key="manual_log_topic")
+            else:
+                goal_id = selected_goal
+                topic = next(
+                    g["topic"] for g in subject_goals if g["id"] == selected_goal
+                )
+        else:
+            topic = st.text_input("Topic", key="manual_log_topic")
+
+    c3, c4 = st.columns(2)
+    with c3:
+        log_date = st.date_input(
+            "Study Date",
+            value=date.today(),
+            max_value=date.today(),
+            key="manual_log_date",
+        )
+    with c4:
+        start_time = st.time_input(
+            "Start Time",
+            value=dtime(18, 0),
+            key="manual_log_start_time",
+        )
+
+    duration = st.number_input(
+        "Duration (minutes)",
+        min_value=1,
+        max_value=1440,
+        value=25,
+        step=5,
+        key="manual_log_duration",
+        help="Enter the actual time you studied, even if you forgot to run the timer.",
+    )
+
+    if st.button(
+        "➕ Add Study Session",
+        type="primary",
+        use_container_width=True,
+        key="add_manual_study_log",
+    ):
+        if not subject or not subject.strip():
+            st.error("Please select or enter a subject.")
+            return
+        if not topic or not topic.strip():
+            st.error("Please select or enter a topic.")
+            return
+
+        log_datetime = datetime.combine(log_date, start_time)
+
+        try:
+            add_study_log(
+                subject.strip(),
+                int(duration),
+                topic=topic.strip(),
+                goal_id=goal_id,
+                log_dt=log_datetime,
+            )
+            st.success(
+                f"Added {format_minutes(duration)} of study time for "
+                f"{subject.strip()} — {topic.strip()} on "
+                f"{log_date:%d %b %Y} at {start_time:%I:%M %p}."
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not add study session: {exc}")
+
+    st.divider()
+    st.subheader("What gets recorded?")
+    st.caption(
+        "The session is added to the same study_logs table as Focus Timer "
+        "sessions, so it contributes to topic totals, subject totals, "
+        "heatmaps, streaks and analytics."
+    )
 
 
 # =============================================================================
@@ -1097,7 +1226,16 @@ def main():
     st.session_state.setdefault("edit_goal_id", None)
 
     st.sidebar.title("🎯 Study Tracker")
-    pages = ["Dashboard", "Add Goal", "Edit Goal", "Resources", "Focus Timer", "Revision Queue", "Analytics"]
+    pages = [
+        "Dashboard",
+        "Add Goal",
+        "Edit Goal",
+        "Resources",
+        "Focus Timer",
+        "Manual Study Log",
+        "Revision Queue",
+        "Analytics",
+    ]
     pending_page = st.session_state.pop("pending_page", None)
     if pending_page in pages:
         st.session_state["navigate_page"] = pending_page
@@ -1123,6 +1261,8 @@ def main():
         render_resources()
     elif page == "Focus Timer":
         render_focus_timer()
+    elif page == "Manual Study Log":
+        render_manual_study_log()
     elif page == "Revision Queue":
         render_revision_queue()
     elif page == "Analytics":
