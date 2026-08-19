@@ -673,7 +673,7 @@ def render_dashboard():
                 with actions:
                     if st.button("✏️ Edit", key=f"edit_{goal['id']}", use_container_width=True):
                         st.session_state.edit_goal_id = goal["id"]
-                        st.session_state.page = "Edit Goal"
+                        st.session_state.pending_page = "Edit Goal"
                         st.rerun()
                     if not completed:
                         if st.button("✅ Complete", key=f"complete_{goal['id']}", use_container_width=True):
@@ -1092,12 +1092,17 @@ def main():
     init_db()
     run_migrations()
 
-    st.session_state.setdefault("page", "Dashboard")
+    st.session_state.setdefault("navigate_page", "Dashboard")
+    st.session_state.setdefault("pending_page", None)
     st.session_state.setdefault("edit_goal_id", None)
 
     st.sidebar.title("🎯 Study Tracker")
     pages = ["Dashboard", "Add Goal", "Edit Goal", "Resources", "Focus Timer", "Revision Queue", "Analytics"]
-    page = st.sidebar.radio("Navigate", pages, key="page", label_visibility="collapsed")
+    pending_page = st.session_state.pop("pending_page", None)
+    if pending_page in pages:
+        st.session_state["navigate_page"] = pending_page
+
+    page = st.sidebar.radio("Navigate", pages, key="navigate_page", label_visibility="collapsed")
 
     st.sidebar.divider()
     total_goals = len(get_goals(order_by_deadline=False))
@@ -1126,4 +1131,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
