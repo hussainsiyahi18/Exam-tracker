@@ -1,20 +1,3 @@
-"""Exam Study & Goal Tracker
-
-Single-file Streamlit + Supabase application with:
-- Full goal CRUD, including editing and deletion
-- Markdown notes per goal
-- Spaced repetition (+1, +3, +7 days)
-- Topic-level focus timer and study logging
-- Study analytics, heatmap and streaks
-- .ics calendar export for exam/revision milestones
-
-Install:
-    pip install streamlit pandas plotly icalendar supabase
-
-Run:
-    streamlit run exam_tracker_updated.py
-"""
-
 import mimetypes
 import time
 import uuid
